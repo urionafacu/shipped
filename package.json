@@ -1,0 +1,25 @@
+{
+  "name": "shipped",
+  "version": "0.1.0",
+  "description": "TUI that tells you whether a branch's commits already reached the testing environments",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "shipped": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@opentui/core": "^0.4.5"
+  }
+}
