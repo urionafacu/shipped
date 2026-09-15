@@ -13,11 +13,13 @@ import {
   shortSha,
   stateGlyph,
   summarize,
+  syncNote,
+  syncTag,
   type AppDeps,
   type Seeds,
 } from "./app";
 import { GitError } from "./git-bridge";
-import type { BranchRef, Comparison, Verdict, Workspace } from "./types";
+import type { BranchRef, Comparison, SyncState, Verdict, Workspace } from "./types";
 
 const mounted: { renderer: CliRenderer; app: ShippedApp }[] = [];
 
@@ -31,8 +33,13 @@ afterEach(() => {
   }
 });
 
-function branch(name: string): BranchRef {
-  return { name, ref: `origin/${name}` };
+function branch(name: string, sync: SyncState = "in-sync"): BranchRef {
+  return {
+    name,
+    ref: sync === "in-sync" ? `origin/${name}` : `refs/heads/${name}`,
+    remoteRef: sync === "local-only" ? null : `origin/${name}`,
+    sync,
+  };
 }
 
 function verdict(overrides: Partial<Verdict> = {}): Verdict {
@@ -41,7 +48,7 @@ function verdict(overrides: Partial<Verdict> = {}): Verdict {
 
 function workspace(overrides: Partial<Workspace> = {}): Workspace {
   return {
-    repo: { root: "/work/web-client", name: "web-client" },
+    repo: { root: "/work/web-client", name: "web-client", worktree: false },
     baseRef: "origin/develop",
     branches: [
       branch("feature/PROJ-517/search-filter-sync"),
@@ -275,6 +282,34 @@ describe("freshnessLabel", () => {
   });
 });
 
+describe("syncTag", () => {
+  test("stays silent for the ordinary case, so the exceptions stand out", () => {
+    expect(syncTag("in-sync")).toBe("");
+  });
+
+  test("marks a branch origin has never seen", () => {
+    expect(syncTag("local-only")).toContain("local only");
+  });
+
+  test("marks a local ref that disagrees with origin", () => {
+    expect(syncTag("diverged")).toContain("≠");
+  });
+});
+
+describe("syncNote", () => {
+  test("stays silent for the ordinary case", () => {
+    expect(syncNote("in-sync")).toBe("");
+  });
+
+  test("spells out that the branch was never pushed", () => {
+    expect(syncNote("local-only")).toContain("never pushed");
+  });
+
+  test("spells out that the local ref differs", () => {
+    expect(syncNote("diverged")).toContain("differs from origin");
+  });
+});
+
 describe("shortSha", () => {
   test("keeps enough to paste into a git command", () => {
     expect(shortSha("f04c9b28e17a5d306cb98241e7f350ad6b2c9e81")).toBe("f04c9b28e");
@@ -316,6 +351,59 @@ describe("ShippedApp — picking the source", () => {
 
   test("asks for the source branch first", async () => {
     expect((await mount()).captureCharFrame()).toContain("source branch");
+  });
+
+  test("says nothing extra about a branch that agrees with origin", async () => {
+    const frame = (await mount()).captureCharFrame();
+
+    expect(frame).not.toContain("local only");
+    expect(frame).not.toContain("local ≠ origin");
+  });
+
+  test("marks a branch that was never pushed", async () => {
+    // Otherwise a branch living in a worktree looks exactly like one everyone
+    // else can see.
+    const { captureCharFrame } = await mount(
+      workspace({ branches: [branch("feature/PROJ-901/in-a-worktree", "local-only")] }),
+    );
+
+    expect(captureCharFrame()).toContain("local only");
+  });
+
+  test("marks a branch whose local ref has outrun origin", async () => {
+    const { captureCharFrame } = await mount(
+      workspace({ branches: [branch("feature/PROJ-902/committed-not-pushed", "diverged")] }),
+    );
+
+    expect(captureCharFrame()).toContain("local ≠ origin");
+  });
+
+  test("offers a local-only branch that shares a fragment with a remote one", async () => {
+    // The bug, at the UI: searching those digits used to surface only the
+    // unrelated remote branch, because the wanted one had never been pushed.
+    const { mockInput, renderOnce, captureCharFrame } = await mount(
+      workspace({
+        branches: [
+          branch("bugfix/DECOY-11351/unrelated", "in-sync"),
+          branch("feature/LOCAL-1351/mine", "local-only"),
+        ],
+      }),
+    );
+
+    await mockInput.pressKeys([..."1351"]);
+    await renderOnce();
+
+    expect(captureCharFrame()).toContain("LOCAL-1351");
+  });
+
+  test("names the repository, not the worktree, when standing in one", async () => {
+    const { captureCharFrame } = await mount(
+      workspace({ repo: { root: "/work/web-client/.trees/feat", name: "web-client", worktree: true } }),
+    );
+    const frame = captureCharFrame();
+
+    expect(frame).toContain("web-client");
+    expect(frame).toContain("worktree");
   });
 
   test("shows how fresh the refs are", async () => {
@@ -516,6 +604,74 @@ describe("ShippedApp — picking the target", () => {
   });
 });
 
+describe("ShippedApp — the list stays inside its box", () => {
+  /**
+   * More branches than the row pool can hold. This is the condition the bug
+   * needed: with a handful of branches the surplus rows are empty and paint
+   * nothing, so every other test in this file passed while a real repository
+   * with hundreds of branches rendered branch names straight over the footer.
+   */
+  function crowded(): Workspace {
+    const many = Array.from({ length: 60 }, (_, i) =>
+      branch(`feature/PROJ-${100 + i}/some-reasonably-long-branch-name`),
+    );
+    return workspace({ branches: [...many, branch("preprod")] });
+  }
+
+  const footerOf = (frame: string) =>
+    frame.split("\n").find((line) => line.includes("ctrl+c")) ?? "";
+
+  test("the footer survives a list longer than the screen", async () => {
+    const frame = (await mount(crowded())).captureCharFrame();
+
+    expect(footerOf(frame)).toContain("type to filter · ↑/↓ move · enter pick");
+  });
+
+  test("no branch name bleeds into the footer", async () => {
+    const frame = (await mount(crowded())).captureCharFrame();
+
+    expect(footerOf(frame)).not.toContain("PROJ-");
+  });
+
+  test("the footer survives the move from the source picker to the target one", async () => {
+    // The transition is what the user hit: seeding a source that matches one
+    // branch jumps straight to the target picker, redrawing the whole screen.
+    const { mockInput, renderOnce, captureCharFrame } = await mount(crowded());
+
+    await mockInput.pressKeys([..."PROJ-142"]);
+    await mockInput.pressKey("RETURN");
+    await settle();
+    await renderOnce();
+    const footer = footerOf(captureCharFrame());
+
+    expect(footer).toContain("type to filter · ↑/↓ move · enter check");
+    expect(footer).not.toContain("PROJ-");
+  });
+
+  test("the status line is not overwritten either", async () => {
+    const { mockInput, renderOnce, captureCharFrame } = await mount(crowded());
+
+    await mockInput.pressKeys([..."PROJ-142"]);
+    await mockInput.pressKey("RETURN");
+    await settle();
+    await renderOnce();
+    const status = captureCharFrame()
+      .split("\n")
+      .find((line) => line.includes("checking"));
+
+    expect(status).toContain("checking feature/PROJ-142/some-reasonably-long-branch-name against");
+  });
+
+  test("the box keeps its bottom border", async () => {
+    // The surplus rows used to paint over it, which is how the overflow showed
+    // up before it reached the footer.
+    const frame = (await mount(crowded())).captureCharFrame();
+    const closing = frame.split("\n").filter((line) => line.includes("└"));
+
+    expect(closing.every((line) => !line.includes("PROJ-"))).toBe(true);
+  });
+});
+
 describe("ShippedApp — the answer", () => {
   test("names both branches and the verdict", async () => {
     const frame = (await openResult({ compare: async () => validatedPartial() })).captureCharFrame();
@@ -545,6 +701,35 @@ describe("ShippedApp — the answer", () => {
 
     expect(frame).toContain("✓  5/5 commits");
     expect(frame).toContain("nothing missing");
+  });
+
+  test("says when the source it answered for was never pushed", async () => {
+    // A ✓ earned against a branch that never left this machine is a different
+    // fact from one earned against origin, and the screen has to say which.
+    const unpushed = comparison({
+      source: branch("bugfix/PROJ-482-disable-export-actions", "local-only"),
+      verdict: verdict({ state: "full", present: 5, total: 5 }),
+    });
+    const frame = (await openResult({ compare: async () => unpushed })).captureCharFrame();
+
+    expect(frame).toContain("never pushed to origin");
+  });
+
+  test("says when the target it answered against exists only locally", async () => {
+    // compare() reads a target from origin whenever origin has one, so the only
+    // way a target ref is local is that origin has never seen the branch.
+    const localTarget = comparison({ target: branch("preprod", "local-only") });
+    const frame = (await openResult({ compare: async () => localTarget })).captureCharFrame();
+
+    expect(frame).toContain("never pushed to origin");
+    expect(frame).toContain("refs/heads/preprod");
+  });
+
+  test("stays quiet when both sides agree with origin", async () => {
+    const frame = (await openResult({ compare: async () => validatedPartial() })).captureCharFrame();
+
+    expect(frame).not.toContain("never pushed");
+    expect(frame).not.toContain("differs from origin");
   });
 
   test("an absorbed branch says so and prints no invented ratio", async () => {

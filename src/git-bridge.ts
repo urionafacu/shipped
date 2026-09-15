@@ -6,7 +6,7 @@
  * caller holds, so a refetch is simply a matter of asking again.
  */
 
-import { basename } from "node:path";
+import { basename, dirname, isAbsolute, resolve } from "node:path";
 
 import { baseRefFromSymbolic, NO_BASE_HINT, pickBaseFallback } from "./base-ref";
 import { chooseStrategy, detect } from "./detect";
@@ -22,6 +22,7 @@ import type {
 } from "./types";
 
 const REMOTE = "origin";
+const LOCAL_PREFIX = "refs/heads/";
 
 export class GitError extends Error {}
 
@@ -64,8 +65,83 @@ export function parseRefList(stdout: string): string[] {
     .filter((line) => line.length > 0 && line !== REMOTE && line !== `${REMOTE}/HEAD`);
 }
 
+/** One ref and the commit it points at, from `%(refname:short) %(objectname)`. */
+export interface RefEntry {
+  /** As git printed it: "develop" for a local ref, "origin/develop" for a remote one. */
+  ref: string;
+  sha: string;
+}
+
+/**
+ * A branch name can contain almost anything but a space, and a SHA never does,
+ * so splitting on the last space is the one split that cannot be fooled.
+ */
+export function parseRefEntries(stdout: string): RefEntry[] {
+  const entries: RefEntry[] = [];
+  for (const raw of stdout.split("\n")) {
+    const line = raw.trim();
+    if (line.length === 0) continue;
+    const split = line.lastIndexOf(" ");
+    if (split === -1) continue;
+    const ref = line.slice(0, split).trim();
+    const sha = line.slice(split + 1).trim();
+    // origin/HEAD is a pointer at another branch, not a branch of its own.
+    if (!SHA.test(sha) || ref.length === 0 || ref === REMOTE || ref === `${REMOTE}/HEAD`) continue;
+    entries.push({ ref, sha });
+  }
+  return entries;
+}
+
 export function branchName(ref: string): string {
+  if (ref.startsWith(LOCAL_PREFIX)) return ref.slice(LOCAL_PREFIX.length);
   return ref.startsWith(`${REMOTE}/`) ? ref.slice(REMOTE.length + 1) : ref;
+}
+
+/**
+ * Merges the local and remote-tracking refs into the one list both pickers read.
+ *
+ * Deduplicated by branch name, because `develop` and `origin/develop` are one
+ * branch to the person asking. When a local ref disagrees with origin's, the
+ * local one wins: it is the work in hand, and whatever it carries beyond origin
+ * is precisely what would show up as missing from the target.
+ */
+export function mergeBranches(local: RefEntry[], remote: RefEntry[]): BranchRef[] {
+  const remoteByName = new Map(remote.map((entry) => [branchName(entry.ref), entry]));
+  const localByName = new Map(local.map((entry) => [branchName(entry.ref), entry]));
+
+  const branches: BranchRef[] = [];
+  for (const name of new Set([...remoteByName.keys(), ...localByName.keys()])) {
+    const here = localByName.get(name);
+    const there = remoteByName.get(name);
+    const remoteRef = there ? `${REMOTE}/${name}` : null;
+
+    if (!here) {
+      branches.push({ name, ref: `${REMOTE}/${name}`, remoteRef, sync: "in-sync" });
+    } else if (!there) {
+      branches.push({ name, ref: `${LOCAL_PREFIX}${name}`, remoteRef, sync: "local-only" });
+    } else if (here.sha === there.sha) {
+      branches.push({ name, ref: `${REMOTE}/${name}`, remoteRef, sync: "in-sync" });
+    } else {
+      branches.push({ name, ref: `${LOCAL_PREFIX}${name}`, remoteRef, sync: "diverged" });
+    }
+  }
+  return branches.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Which ref actually answers for a target, and what is honest to say about it.
+ *
+ * Origin's ref wins whenever there is one. A target is the question "has this
+ * arrived where the team will see it", and the team sees origin — a local copy
+ * of a long-lived branch is routinely far behind and would report work as
+ * missing that arrived weeks ago. With origin's ref in hand there is also
+ * nothing left to warn about, so the mark goes quiet; a target origin has never
+ * heard of keeps its `local-only` mark, because that one still changes how the
+ * answer should be read.
+ */
+export function resolveTarget(target: BranchRef): BranchRef {
+  if (target.remoteRef === null) return target;
+  return { ...target, ref: target.remoteRef, sync: "in-sync" };
 }
 
 /** Reads `git log --format=%H %s`: SHA, a space, then the rest of the line. */
@@ -118,16 +194,47 @@ export async function findRepoRoot(cwd: string): Promise<RepoContext> {
   if (root.length === 0) {
     throw new GitError(`${cwd} is not inside a git repository`);
   }
-  return { root, name: basename(root) };
+
+  const common = await git(cwd, ["rev-parse", "--git-common-dir"]);
+  const mainRoot = common.ok ? mainWorkTree(root, common.stdout.trim()) : root;
+  return { root, name: basename(mainRoot), worktree: mainRoot !== root };
 }
 
-export async function listRemoteBranches(repoPath: string): Promise<string[]> {
+/**
+ * Where the repository's main work tree lives, from `--git-common-dir`.
+ *
+ * In a normal checkout that is the relative ".git" and the answer is the root we
+ * already have. In a linked worktree it is an absolute path to the main
+ * checkout's ".git", whose parent is the repository everyone would name — the
+ * worktree's own directory is usually named after a branch.
+ */
+export function mainWorkTree(root: string, commonDir: string): string {
+  if (commonDir.length === 0) return root;
+  const absolute = resolve(isAbsolute(commonDir) ? commonDir : `${root}/${commonDir}`);
+  // A bare repository has no ".git" to strip and is its own name.
+  return basename(absolute) === ".git" ? dirname(absolute) : absolute;
+}
+
+async function listRefs(repoPath: string, namespace: string): Promise<RefEntry[]> {
   const stdout = await gitOrThrow(repoPath, [
     "for-each-ref",
-    "--format=%(refname:short)",
-    `refs/remotes/${REMOTE}`,
+    "--format=%(refname:short) %(objectname)",
+    namespace,
   ]);
-  return parseRefList(stdout);
+  return parseRefEntries(stdout);
+}
+
+export function listRemoteBranches(repoPath: string): Promise<RefEntry[]> {
+  return listRefs(repoPath, `refs/remotes/${REMOTE}`);
+}
+
+/**
+ * Local branches matter because a branch checked out in a worktree and never
+ * pushed is invisible under refs/remotes — and a fragment naming it would
+ * otherwise match some unrelated branch that happens to share its digits.
+ */
+export function listLocalBranches(repoPath: string): Promise<RefEntry[]> {
+  return listRefs(repoPath, LOCAL_PREFIX);
 }
 
 export async function refExists(repoPath: string, ref: string): Promise<boolean> {
@@ -222,16 +329,20 @@ export async function loadWorkspace(cwd: string, fetch = true): Promise<Workspac
     : { fetchedAt: null, stale: true };
   if (freshness.error) warnings.push(`fetch failed — ${freshness.error}`);
 
-  const refs = await listRemoteBranches(repo.root);
-  const refSet = new Set(refs);
+  const [remote, local] = await Promise.all([
+    listRemoteBranches(repo.root),
+    listLocalBranches(repo.root),
+  ]);
 
-  const baseRef = await resolveBaseRef(repo.root, refSet);
+  // The base ref stays a remote-tracking one on purpose: it is the shared point
+  // of reference the whole team forks from, not whatever this machine has.
+  const baseRef = await resolveBaseRef(repo.root, new Set(remote.map((entry) => entry.ref)));
   if (baseRef === null) throw new GitError(NO_BASE_HINT);
 
   return {
     repo,
     baseRef,
-    branches: refs.map((ref) => ({ name: branchName(ref), ref })),
+    branches: mergeBranches(local, remote),
     freshness,
     warnings,
   };
@@ -245,11 +356,13 @@ export async function loadWorkspace(cwd: string, fetch = true): Promise<Workspac
  */
 export async function compare(
   source: BranchRef,
-  target: BranchRef,
+  requested: BranchRef,
   workspace: Workspace,
 ): Promise<Comparison> {
   const { root } = workspace.repo;
   const { baseRef } = workspace;
+  // The two sides resolve differently on purpose: see resolveTarget.
+  const target = resolveTarget(requested);
 
   const own = await ownCommits(root, source.ref, baseRef);
   const strategy = chooseStrategy(own, false);

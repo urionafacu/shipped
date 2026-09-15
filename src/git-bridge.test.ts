@@ -7,16 +7,29 @@ import {
   findRepoRoot,
   GitError,
   isAncestor,
+  listLocalBranches,
   listRemoteBranches,
   loadWorkspace,
+  mainWorkTree,
+  mergeBranches,
   ownCommits,
   parseCherry,
   parseCommitLog,
+  parseRefEntries,
   parseRefList,
   refExists,
   resolveBaseRef,
+  resolveTarget,
+  type RefEntry,
 } from "./git-bridge";
-import { buildSyntheticRepo, gitAvailable, SYNTHETIC, type SyntheticRepo } from "./synthetic-repo";
+import {
+  buildSyntheticRepo,
+  gitAvailable,
+  SYNTHETIC,
+  SYNTHETIC_SYNC,
+  type SyntheticRepo,
+} from "./synthetic-repo";
+import type { BranchRef } from "./types";
 
 describe("parseRefList", () => {
   test("returns the remote refs as git printed them", () => {
@@ -51,8 +64,165 @@ describe("branchName", () => {
     );
   });
 
+  test("strips the local refs/heads prefix", () => {
+    expect(branchName("refs/heads/feature/PROJ-517/sync")).toBe("feature/PROJ-517/sync");
+  });
+
   test("leaves a name that carries no prefix alone", () => {
     expect(branchName("develop")).toBe("develop");
+  });
+});
+
+describe("parseRefEntries", () => {
+  const sha = (char: string) => char.repeat(40);
+
+  test("splits each line into ref and commit", () => {
+    const out = `develop ${sha("a")}\norigin/qa ${sha("b")}\n`;
+    expect(parseRefEntries(out)).toEqual([
+      { ref: "develop", sha: sha("a") },
+      { ref: "origin/qa", sha: sha("b") },
+    ]);
+  });
+
+  test("keeps a branch name that contains spaces out of the SHA", () => {
+    // git allows almost anything but a space in a ref, yet the split has to be
+    // the last space regardless, since a SHA never contains one.
+    expect(parseRefEntries(`feature/a b ${sha("c")}\n`)).toEqual([
+      { ref: "feature/a b", sha: sha("c") },
+    ]);
+  });
+
+  test("drops the origin HEAD pointer however it is spelled", () => {
+    const out = `origin ${sha("a")}\norigin/HEAD ${sha("a")}\norigin/develop ${sha("b")}\n`;
+    expect(parseRefEntries(out)).toEqual([{ ref: "origin/develop", sha: sha("b") }]);
+  });
+
+  test("skips a line whose trailing field is not a SHA", () => {
+    expect(parseRefEntries(`warning: something git said\ndevelop ${sha("a")}\n`)).toEqual([
+      { ref: "develop", sha: sha("a") },
+    ]);
+  });
+
+  test("survives empty output", () => {
+    expect(parseRefEntries("")).toEqual([]);
+    expect(parseRefEntries("\n\n")).toEqual([]);
+  });
+});
+
+describe("mergeBranches", () => {
+  const sha = (char: string) => char.repeat(40);
+  const entry = (ref: string, at: string): RefEntry => ({ ref, sha: sha(at) });
+
+  test("keeps a branch that exists only on origin", () => {
+    expect(mergeBranches([], [entry("origin/qa", "a")])).toEqual([
+      { name: "qa", ref: "origin/qa", remoteRef: "origin/qa", sync: "in-sync" },
+    ]);
+  });
+
+  test("keeps a branch that exists only locally, and says so", () => {
+    expect(mergeBranches([entry("feature/x", "a")], [])).toEqual([
+      { name: "feature/x", ref: "refs/heads/feature/x", remoteRef: null, sync: "local-only" },
+    ]);
+  });
+
+  test("collapses the two refs of one branch into a single entry", () => {
+    expect(mergeBranches([entry("qa", "a")], [entry("origin/qa", "a")])).toEqual([
+      { name: "qa", ref: "origin/qa", remoteRef: "origin/qa", sync: "in-sync" },
+    ]);
+  });
+
+  test("prefers the local ref as a source when the tips disagree", () => {
+    // The local ref carries work origin does not have, and that work is exactly
+    // what would come back as missing from a target.
+    expect(mergeBranches([entry("qa", "a")], [entry("origin/qa", "b")])).toEqual([
+      { name: "qa", ref: "refs/heads/qa", remoteRef: "origin/qa", sync: "diverged" },
+    ]);
+  });
+
+  test("does not confuse two branches whose names share a fragment", () => {
+    // The bug: searching "1351" used to find only the unrelated remote branch,
+    // because the branch actually being looked for had never been pushed.
+    const merged = mergeBranches(
+      [entry("feature/LOCAL-1351/mine", "a")],
+      [entry("origin/bugfix/DECOY-11351/theirs", "b")],
+    );
+
+    expect(merged.map((b) => b.name)).toEqual([
+      "bugfix/DECOY-11351/theirs",
+      "feature/LOCAL-1351/mine",
+    ]);
+  });
+
+  test("sorts by name so the picker order does not depend on git's", () => {
+    const merged = mergeBranches([entry("zulu", "a")], [entry("origin/alpha", "b")]);
+    expect(merged.map((b) => b.name)).toEqual(["alpha", "zulu"]);
+  });
+
+  test("survives a repository with no branches at all", () => {
+    expect(mergeBranches([], [])).toEqual([]);
+  });
+});
+
+describe("resolveTarget", () => {
+  const local = (name: string, sync: "diverged" | "local-only"): BranchRef => ({
+    name,
+    ref: `refs/heads/${name}`,
+    remoteRef: sync === "diverged" ? `origin/${name}` : null,
+    sync,
+  });
+
+  test("reads a target from origin even when a local ref exists", () => {
+    // Measured on a real checkout: a worktree's local `testing` sat 361 commits
+    // behind origin's, and against it 8 of 14 recent branches read as ABSENT
+    // when their work had in fact been there for weeks. A target answers "has
+    // this arrived where the team looks", and the team looks at origin.
+    expect(resolveTarget(local("testing", "diverged"))).toEqual({
+      name: "testing",
+      ref: "origin/testing",
+      remoteRef: "origin/testing",
+      sync: "in-sync",
+    });
+  });
+
+  test("leaves a target origin has never heard of on its local ref", () => {
+    const only = local("feature/x", "local-only");
+    expect(resolveTarget(only)).toEqual(only);
+  });
+
+  test("keeps the local-only mark, which still changes how to read the answer", () => {
+    expect(resolveTarget(local("feature/x", "local-only")).sync).toBe("local-only");
+  });
+
+  test("leaves an already-remote target untouched", () => {
+    const remote: BranchRef = {
+      name: "qa",
+      ref: "origin/qa",
+      remoteRef: "origin/qa",
+      sync: "in-sync",
+    };
+    expect(resolveTarget(remote)).toEqual(remote);
+  });
+});
+
+describe("mainWorkTree", () => {
+  test("stays put in an ordinary checkout, where the common dir is relative", () => {
+    expect(mainWorkTree("/work/web-client", ".git")).toBe("/work/web-client");
+  });
+
+  test("climbs to the repository a linked worktree belongs to", () => {
+    // The worktree's own directory is usually named after its branch, which
+    // reads as the wrong repository in the header.
+    expect(mainWorkTree("/work/web-client/.trees/feature-x", "/work/web-client/.git")).toBe(
+      "/work/web-client",
+    );
+  });
+
+  test("names a bare repository after itself", () => {
+    expect(mainWorkTree("/work/web-client", "/srv/web-client.git")).toBe("/srv/web-client.git");
+  });
+
+  test("falls back to the root when git said nothing", () => {
+    expect(mainWorkTree("/work/web-client", "")).toBe("/work/web-client");
   });
 });
 
@@ -160,7 +330,12 @@ describe.skipIf(!runnable)("against a synthetic repository", () => {
     await repo?.cleanup();
   });
 
-  const ref = (r: string) => ({ name: branchName(r), ref: r });
+  const ref = (r: string): BranchRef => ({
+    name: branchName(r),
+    ref: r,
+    remoteRef: r.startsWith("origin/") ? r : null,
+    sync: "in-sync",
+  });
   const ask = (source: string, target: string) => compare(ref(source), ref(target), workspace);
 
   describe("findRepoRoot", () => {
@@ -178,6 +353,26 @@ describe.skipIf(!runnable)("against a synthetic repository", () => {
       expect((await findRepoRoot(path)).name).toBe("repo");
     });
 
+    test("does not call an ordinary checkout a worktree", async () => {
+      expect((await findRepoRoot(path)).worktree).toBe(false);
+    });
+
+    test("names the repository, not the worktree, from inside a linked worktree", async () => {
+      // A worktree directory is usually named after its branch, so its basename
+      // reads as a repository nobody has.
+      const tree = `${path}/../wt-preprod`;
+      await Bun.$`git -C ${path} worktree add -q --detach ${tree}`.quiet();
+      try {
+        const context = await findRepoRoot(tree);
+
+        expect(context.name).toBe("repo");
+        expect(context.worktree).toBe(true);
+        expect(context.root).not.toBe(path);
+      } finally {
+        await Bun.$`git -C ${path} worktree remove --force ${tree}`.quiet().nothrow();
+      }
+    });
+
     test("refuses a directory that is not inside a repository", async () => {
       expect(findRepoRoot("/")).rejects.toThrow(GitError);
     });
@@ -185,7 +380,7 @@ describe.skipIf(!runnable)("against a synthetic repository", () => {
 
   describe("resolveBaseRef", () => {
     test("reads origin/HEAD when the clone recorded one", async () => {
-      const refs = new Set(await listRemoteBranches(path));
+      const refs = new Set((await listRemoteBranches(path)).map((e) => e.ref));
       expect(await resolveBaseRef(path, refs)).toBe(SYNTHETIC.develop);
     });
 
@@ -194,7 +389,7 @@ describe.skipIf(!runnable)("against a synthetic repository", () => {
       // `git remote set-head` has never run.
       const bare = await buildSyntheticRepo({ symbolicHead: false });
       try {
-        const refs = new Set(await listRemoteBranches(bare.path));
+        const refs = new Set((await listRemoteBranches(bare.path)).map((e) => e.ref));
         expect(await resolveBaseRef(bare.path, refs)).toBe(SYNTHETIC.develop);
       } finally {
         await bare.cleanup();
@@ -206,7 +401,7 @@ describe.skipIf(!runnable)("against a synthetic repository", () => {
       const stale = await buildSyntheticRepo();
       try {
         await Bun.$`git -C ${stale.path} symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/deleted`.quiet();
-        const refs = new Set(await listRemoteBranches(stale.path));
+        const refs = new Set((await listRemoteBranches(stale.path)).map((e) => e.ref));
         expect(await resolveBaseRef(stale.path, refs)).toBe(SYNTHETIC.develop);
       } finally {
         await stale.cleanup();
@@ -223,16 +418,19 @@ describe.skipIf(!runnable)("against a synthetic repository", () => {
       expect(workspace.baseRef).toBe(SYNTHETIC.develop);
     });
 
-    test("offers every remote branch, choosing none of them", () => {
+    test("offers every branch, local and remote alike, choosing none of them", () => {
       // Both pickers read this list. Anything that pre-selected a branch here
       // would be the default list coming back in another shape.
       const names = workspace.branches.map((b) => b.name).sort();
       expect(names).toEqual(
         [
           "bugfix/ABSORBED-1/already-in-develop",
+          SYNTHETIC_SYNC.decoy,
           "develop",
           "feature/ACTIVE-1/partially-shipped",
           "feature/CLEAN-1/merged-straight-in",
+          SYNTHETIC_SYNC.unpushed,
+          "main",
           "preprod",
           "qa",
           "release",
@@ -240,10 +438,47 @@ describe.skipIf(!runnable)("against a synthetic repository", () => {
       );
     });
 
-    test("does not leak the local branches the fixture was built from", () => {
-      // The tool compares remote-tracking refs only; a local branch of the same
-      // name would answer for whatever is checked out rather than for origin.
-      expect(workspace.branches.every((b) => b.ref.startsWith("origin/"))).toBe(true);
+    test("lists a branch once, however many refs carry its name", () => {
+      // "qa" and "origin/qa" are one branch to the person asking.
+      const names = workspace.branches.map((b) => b.name);
+      expect(new Set(names).size).toBe(names.length);
+    });
+
+    test("finds a branch that only ever existed locally", () => {
+      // The bug this fixes: a branch checked out in a worktree and never pushed
+      // is invisible under refs/remotes, so it could not be asked about at all.
+      const found = workspace.branches.find((b) => b.name === SYNTHETIC_SYNC.unpushed);
+
+      expect(found?.sync).toBe("local-only");
+      expect(found?.ref).toBe(`refs/heads/${SYNTHETIC_SYNC.unpushed}`);
+    });
+
+    test("flags a branch whose local ref has outrun origin", () => {
+      const found = workspace.branches.find((b) => b.name === SYNTHETIC_SYNC.diverged);
+
+      // The local ref wins: its extra commits are exactly what would be missing
+      // from a target, which is the answer worth having.
+      expect(found?.sync).toBe("diverged");
+      expect(found?.ref).toBe(`refs/heads/${SYNTHETIC_SYNC.diverged}`);
+    });
+
+    test("says nothing about a branch whose local ref agrees with origin", () => {
+      const found = workspace.branches.find((b) => b.name === SYNTHETIC_SYNC.synced);
+
+      expect(found?.sync).toBe("in-sync");
+      expect(found?.ref).toBe(`origin/${SYNTHETIC_SYNC.synced}`);
+    });
+
+    test("prefers origin for a branch that exists nowhere locally", () => {
+      const found = workspace.branches.find((b) => b.name === SYNTHETIC_SYNC.decoy);
+
+      expect(found?.sync).toBe("in-sync");
+      expect(found?.ref).toBe(`origin/${SYNTHETIC_SYNC.decoy}`);
+    });
+
+    test("measures against origin's base ref, not a local one", () => {
+      // A local base would answer for whatever this machine last pulled.
+      expect(workspace.baseRef.startsWith("origin/")).toBe(true);
     });
 
     test("marks the refs stale when the fetch was skipped", () => {
@@ -257,12 +492,30 @@ describe.skipIf(!runnable)("against a synthetic repository", () => {
 
   describe("queries", () => {
     test("lists remote branches without the HEAD pointer", async () => {
-      const refs = await listRemoteBranches(path);
+      const refs = (await listRemoteBranches(path)).map((entry) => entry.ref);
 
       expect(refs).toContain(SYNTHETIC.develop);
       expect(refs).toContain(SYNTHETIC.qa);
       expect(refs).not.toContain("origin");
       expect(refs.every((r) => r.startsWith("origin/"))).toBe(true);
+    });
+
+    test("lists local branches, which refs/remotes cannot see", async () => {
+      const refs = (await listLocalBranches(path)).map((entry) => entry.ref);
+
+      expect(refs).toContain(SYNTHETIC_SYNC.unpushed);
+      expect(refs).toContain(SYNTHETIC_SYNC.synced);
+      expect(refs.every((r) => !r.startsWith("origin/"))).toBe(true);
+    });
+
+    test("reports the commit each ref points at", async () => {
+      const local = await listLocalBranches(path);
+      const entry = local.find((e) => e.ref === SYNTHETIC_SYNC.unpushed);
+      const sha = (await Bun.$`git -C ${path} rev-parse ${SYNTHETIC_SYNC.unpushed}`.text()).trim();
+
+      // The SHA is what separates a synced branch from a diverged one, so it has
+      // to come back with the ref rather than cost a call per branch.
+      expect(entry?.sha).toBe(sha);
     });
 
     test("refExists tells a real ref from one that merely looks plausible", async () => {
@@ -330,6 +583,30 @@ describe.skipIf(!runnable)("against a synthetic repository", () => {
       const { verdict } = await ask(SYNTHETIC.active, SYNTHETIC.qa);
 
       expect(verdict).toMatchObject({ state: "absent", present: 0, total: 5 });
+    });
+
+    test("answers for a source that exists only on this machine", async () => {
+      // The whole point of listing local refs: before this, a branch living in
+      // a worktree and never pushed could not be asked about at all.
+      const source = workspace.branches.find((b) => b.name === SYNTHETIC_SYNC.unpushed)!;
+      const target = workspace.branches.find((b) => b.name === "qa")!;
+      const result = await compare(source, target, workspace);
+
+      expect(source.sync).toBe("local-only");
+      expect(result.own).toHaveLength(1);
+      expect(result.verdict).toMatchObject({ state: "absent", present: 0, total: 1 });
+    });
+
+    test("reads a diverged target from origin, not from the local copy", async () => {
+      // A local copy of a long-lived branch runs behind, and measured against
+      // one, work that arrived weeks ago reads as missing.
+      const source = workspace.branches.find((b) => b.name === SYNTHETIC_SYNC.unpushed)!;
+      const target = workspace.branches.find((b) => b.name === SYNTHETIC_SYNC.diverged)!;
+      const result = await compare(source, target, workspace);
+
+      expect(target.sync).toBe("diverged");
+      expect(target.ref).toBe(`refs/heads/${SYNTHETIC_SYNC.diverged}`);
+      expect(result.target.ref).toBe(`origin/${SYNTHETIC_SYNC.diverged}`);
     });
 
     test("the base branch is a target like any other", async () => {

@@ -20,7 +20,14 @@ import {
 } from "@opentui/core";
 
 import { compare, GitError, loadWorkspace } from "./git-bridge";
-import type { BranchRef, Comparison, Freshness, Verdict, Workspace } from "./types";
+import type {
+  BranchRef,
+  Comparison,
+  Freshness,
+  SyncState,
+  Verdict,
+  Workspace,
+} from "./types";
 
 const theme = {
   bg: "#0b1220",
@@ -58,8 +65,16 @@ export interface Seeds {
   target?: string;
 }
 
-/** Rows reserved for chrome: header, search field, footer. */
-const CHROME_HEIGHT = 10;
+/**
+ * Rows the chrome takes before any branch is listed: root padding, the header,
+ * the search field, the footer, this box's own borders, and the gaps between
+ * them. Deliberately generous — it only sizes the pool, and `drawList` asks the
+ * laid-out box how many of those rows actually fit before writing to them.
+ */
+const CHROME_HEIGHT = 15;
+
+/** Borders, top and bottom, inside the box's laid-out height. */
+const LIST_BORDERS = 2;
 
 export class ShippedApp {
   private step: Step = "source";
@@ -172,6 +187,11 @@ export class ShippedApp {
       title: " matches ",
       titleColor: theme.dim,
       paddingX: 1,
+      // Without this, a pool taller than the box does not shrink: flex lays the
+      // surplus rows out past the bottom border, straight over the status line
+      // and the footer, and what the user reads is branch names bleeding
+      // through the help text.
+      overflow: "hidden",
     });
     // A fixed pool of rows windowed by hand: rebuilding renderables on every
     // keystroke over a few thousand branches is what makes a filter feel slow.
@@ -306,24 +326,44 @@ export class ShippedApp {
     const { repo, baseRef, branches, freshness, warnings } = this.workspace;
     const age = freshnessLabel(freshness, Date.now());
     const warn = warnings.length > 0 ? ` · ! ${warnings[0]}` : "";
-    return `${repo.name} · ${branches.length} branches · base ${baseRef} · ${age}${warn}`;
+    const where = repo.worktree ? `${repo.name} (worktree)` : repo.name;
+    return `${where} · ${branches.length} branches · base ${baseRef} · ${age}${warn}`;
+  }
+
+  /**
+   * How many pooled rows the box can actually show right now.
+   *
+   * Asked of the laid-out box rather than recomputed from the terminal size:
+   * the pool is built once from a constant, and any drift between that constant
+   * and the real layout used to be painted outside the box rather than dropped.
+   */
+  private listCapacity(): number {
+    const inner = this.listBox.height - LIST_BORDERS;
+    // The first draw happens in the constructor, before any layout pass, so the
+    // box has no height yet. Fall back to the whole pool: `overflow: hidden`
+    // keeps a too-tall pool clipped rather than painted over the footer, and the
+    // next refresh measures for real.
+    if (inner <= 0) return this.listRows.length;
+    return Math.min(this.listRows.length, inner);
   }
 
   private drawList(): void {
-    const height = this.listRows.length;
+    const height = this.listCapacity();
     // Keep the cursor inside the window without jumping it to the middle.
     if (this.cursor < this.window) this.window = this.cursor;
-    else if (this.cursor >= this.window + height) this.window = this.cursor - height + 1;
+    else if (height > 0 && this.cursor >= this.window + height) {
+      this.window = this.cursor - height + 1;
+    }
 
     for (const [i, row] of this.listRows.entries()) {
-      const branch = this.matches[this.window + i];
+      const branch = i < height ? this.matches[this.window + i] : undefined;
       if (!branch) {
         row.content = "";
         continue;
       }
       const selected = this.window + i === this.cursor;
-      row.content = `${selected ? "› " : "  "}${branch.name}`;
-      row.fg = selected ? theme.accent : theme.fg;
+      row.content = `${selected ? "› " : "  "}${branch.name}${syncTag(branch.sync)}`;
+      row.fg = selected ? theme.accent : branch.sync === "in-sync" ? theme.fg : theme.warn;
     }
 
     if (this.matches.length === 0) {
@@ -342,7 +382,13 @@ export class ShippedApp {
       strategy === "ancestry"
         ? `${baseRef} already absorbed this branch — only all-or-nothing is knowable`
         : `${own.length} commit(s) of its own vs ${baseRef}`;
-    this.pairText.content = `source  ${source.name}\ntarget  ${target.ref}\n${note}`;
+    // Which ref each side resolved to, because a ✓ earned against a branch that
+    // never left this machine is a different fact from one earned against origin.
+    this.pairText.content =
+      `source  ${source.name}${syncNote(source.sync)}\n` +
+      `target  ${target.ref}${syncNote(target.sync)}\n` +
+      note;
+    this.pairText.fg = source.sync === "in-sync" && target.sync === "in-sync" ? theme.fg : theme.warn;
 
     this.verdictText.content = `\n  ${stateGlyph(verdict.state)}  ${describeVerdict(verdict)}`;
     this.verdictText.fg = stateColor(verdict.state);
@@ -552,6 +598,33 @@ function claim(key: KeyEvent): void {
 
 export function shortSha(sha: string): string {
   return sha.slice(0, 9);
+}
+
+/**
+ * The picker-list mark. Short, because it sits beside a branch name that is
+ * already long, and silent for the ordinary case so the exceptions stand out.
+ */
+export function syncTag(sync: SyncState): string {
+  switch (sync) {
+    case "in-sync":
+      return "";
+    case "local-only":
+      return "  · local only";
+    case "diverged":
+      return "  · local ≠ origin";
+  }
+}
+
+/** The same fact spelled out, where there is room for it on the answer screen. */
+export function syncNote(sync: SyncState): string {
+  switch (sync) {
+    case "in-sync":
+      return "";
+    case "local-only":
+      return "  (local only — never pushed to origin)";
+    case "diverged":
+      return "  (local ref, differs from origin)";
+  }
 }
 
 export function stateGlyph(state: Verdict["state"]): string {

@@ -16,10 +16,13 @@ usage:
   --no-fetch   skip the startup fetch and answer from the local refs.
                Faster, but the answer is only as fresh as your last fetch.
 
-Runs against the repository you are standing in. Both branches are picked from
-the ones this repository actually has — nothing is assumed about how you name
-them. A fragment that matches exactly one branch skips its picker, so naming
-both answers the question in a single command.
+Runs against the repository you are standing in, worktrees included. Both
+branches are picked from the ones this repository actually has, local ones too —
+nothing is assumed about how you name them. A fragment that matches exactly one
+branch skips its picker, so naming both answers the question in a single command.
+
+A branch that origin has never seen is marked in the list, and so is one whose
+local ref disagrees with origin's.
 
 examples:
   cd path/to/your/repo && shipped

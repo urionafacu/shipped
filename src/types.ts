@@ -2,10 +2,16 @@
 
 /** The repository the tool was invoked inside. */
 export interface RepoContext {
-  /** Absolute path to the work tree root. */
+  /** Absolute path to the work tree root — a linked worktree's own root, when in one. */
   root: string;
-  /** Basename of the root, for the header. */
+  /**
+   * Name of the repository itself, not of the directory the user stands in. In a
+   * linked worktree those differ, and the worktree's directory name is usually
+   * the branch, which reads as the wrong repository in the header.
+   */
   name: string;
+  /** True in a linked worktree, where `root` is not the repository's main work tree. */
+  worktree: boolean;
 }
 
 export interface CommitRef {
@@ -15,15 +21,44 @@ export interface CommitRef {
 }
 
 /**
- * A remote branch of the current repository. Both sides of a comparison are one
- * of these: the tool holds no opinion about which branches are worth asking
- * about, so a target is simply another branch the repository has.
+ * How a branch's local ref stands against origin's. Worth saying out loud: an
+ * answer computed from a branch that never left the machine is still a true
+ * answer, but not the one someone reading `✓` would assume.
+ *
+ * - `in-sync`     nothing to flag — origin has it, and any local ref agrees
+ * - `local-only`  never pushed: origin has no branch by this name
+ * - `diverged`    a local ref exists and its tip disagrees with origin's
+ */
+export type SyncState = "in-sync" | "local-only" | "diverged";
+
+/**
+ * A branch of the current repository. Both sides of a comparison are one of
+ * these: the tool holds no opinion about which branches are worth asking about,
+ * so a target is simply another branch the repository has.
+ *
+ * Local and remote-tracking refs are merged by branch name, because a branch
+ * living in a worktree and never pushed is exactly the work someone is most
+ * likely to be asking about.
  */
 export interface BranchRef {
-  /** Ref name without the remote prefix, e.g. "feature/PROJ-517/search-filter-sync". */
+  /** Bare branch name, e.g. "feature/PROJ-517/search-filter-sync". */
   name: string;
-  /** Fully qualified, e.g. "origin/feature/PROJ-517/search-filter-sync". */
+  /**
+   * The ref to read this branch as a *source*: `refs/heads/…` when a local ref
+   * exists and carries work origin does not have, `origin/…` otherwise. The
+   * work in hand is what someone asking about their own branch means.
+   */
   ref: string;
+  /**
+   * The ref to read this branch as a *target*, when origin has one at all.
+   *
+   * A target answers "has my work arrived where the team will see it", and the
+   * team sees origin. A local copy of a long-lived branch is routinely months
+   * behind, and measured against one it reports work as missing that has been
+   * there all along — the exact mistake this tool exists to prevent.
+   */
+  remoteRef: string | null;
+  sync: SyncState;
 }
 
 /**
@@ -104,7 +139,7 @@ export interface Workspace {
   repo: RepoContext;
   /** The branch the tool measures a source branch's own commits against. */
   baseRef: string;
-  /** Every remote branch of this repository. Both pickers read from this. */
+  /** Every branch of this repository, local and remote alike. Both pickers read this. */
   branches: BranchRef[];
   freshness: Freshness;
   /** Anything worth saying in the header without failing the session. */

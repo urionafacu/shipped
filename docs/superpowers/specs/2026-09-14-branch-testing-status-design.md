@@ -83,6 +83,49 @@ Found from the cwd with `git rev-parse --show-toplevel`, so the tool works from
 any subdirectory of a checkout. Outside a repository it says so and exits
 non-zero rather than guessing.
 
+Inside a linked worktree that toplevel is the worktree's own root, whose
+directory is usually named after the branch it holds — as a repository name it
+reads as one nobody has. The name therefore comes from `git rev-parse
+--git-common-dir`: relative (`.git`) in an ordinary checkout, and an absolute
+path to the main checkout's `.git` in a worktree, whose parent is the repository
+everyone would recognise.
+
+## Branches
+
+The branch list is the union of `refs/heads` and `refs/remotes/origin`,
+deduplicated by name — `develop` and `origin/develop` are one branch to the
+person asking. Both pickers read it.
+
+Local refs are in the list because a branch checked out in a worktree and never
+pushed is exactly the work most likely to be asked about, and under
+remote-tracking refs alone it is invisible. Worse than invisible: on a real
+checkout, searching a fragment of such a branch returned an unrelated remote
+branch that shared its digits, so the tool answered confidently about the wrong
+branch rather than admitting it could not find the right one.
+
+Each entry carries how its refs stand against each other — `in-sync`,
+`local-only`, or `diverged` — and the UI marks the last two, because an answer
+computed from a branch that never left the machine is still true but not the
+fact a bare `✓` suggests.
+
+### Which ref each side reads
+
+The two sides resolve differently, and the asymmetry is deliberate:
+
+| side | ref | why |
+|---|---|---|
+| source | local when one exists | the work in hand; anything it carries beyond `origin` is exactly what should read as missing |
+| target | `origin` when one exists | the question is whether the work reached where the team looks, and the team looks at `origin` |
+
+The target rule was measured rather than assumed. On a real checkout a
+worktree's local `testing` sat **361 commits behind** `origin/testing`; of 14
+recent branches, **8** reported differently against the two, always in the
+dangerous direction — work already in `testing` reported as absent, which is the
+exact mistake this tool exists to prevent.
+
+A target `origin` has never heard of stays on its local ref and keeps its
+`local-only` mark; there is nothing else to read it from, and the mark says so.
+
 ## The base branch
 
 The branch a feature forks from is read from `origin/HEAD`, which `git clone`
@@ -100,8 +143,8 @@ fail. If nothing resolves, the tool says so and names `git remote set-head origi
 ## Targets
 
 There are none, in the sense of a list this tool holds. The target is a branch
-the user picks from the same list the source is picked from — every remote
-branch the repository has.
+the user picks from the same list the source is picked from — every branch the
+repository has, local and remote alike.
 
 This is the second revision's whole content, and it is worth being explicit
 about why the alternatives were rejected:
@@ -209,8 +252,16 @@ before the first paint is short enough to keep.
 ## Interface
 
 Three steps, and the first two are the same widget: a fuzzy filter over the
-remote branches of the current repository, where substrings of the ticket or of
-the description both match.
+branches of the current repository, where substrings of the ticket or of the
+description both match.
+
+The match list draws from a fixed pool of row renderables rather than rebuilding
+them per keystroke, which over a few thousand branches is the difference between
+a filter that feels instant and one that does not. The pool is sized from a
+constant, so it must be clipped: `overflow: "hidden"` on the box, and a row count
+taken from the laid-out box rather than from the constant. Without both, a pool
+taller than its box laid the surplus rows out past the bottom border and over the
+footer, and the help text came out with branch names woven through it.
 
 ```
  web-client · 412 branches · base origin/develop · fetched 2m ago

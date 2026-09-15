@@ -23,6 +23,10 @@
  *   clean     2 own commits, merged into qa with a real merge commit, so
  *             `git cherry` emits empty output
  *             -> qa FULL 2/2 · preprod ABSENT 0/2 · release ABSENT 0/2
+ *
+ * It also carries the three ways a local ref can stand against origin's — see
+ * SYNTHETIC_SYNC — because a branch that only ever existed locally is invisible
+ * under refs/remotes, and that is the common shape in a worktree.
  */
 
 import { mkdtemp, realpath, rm } from "node:fs/promises";
@@ -45,8 +49,29 @@ export interface SyntheticOptions {
   symbolicHead?: boolean;
 }
 
+/**
+ * The branches that exercise how a local ref stands against origin's.
+ *
+ * `unpushed` exists only under refs/heads, which is what a branch checked out in
+ * a worktree and never pushed looks like. Its name carries digits that also
+ * appear inside `decoy`, reproducing the false match that motivated listing
+ * local refs at all: searching those digits used to return the unrelated remote
+ * branch and never the branch actually being looked for.
+ */
+export const SYNTHETIC_SYNC = {
+  /** Local and remote agree — nothing for the UI to flag. */
+  synced: "qa",
+  /** Never pushed: refs/heads only. */
+  unpushed: "feature/LOCAL-1351/only-on-this-machine",
+  /** Pushed, then committed on top without pushing again. */
+  diverged: "release",
+  /** Remote-only, and its name contains 1351 — the collision, made real. */
+  decoy: "bugfix/DECOY-11351/unrelated-but-similar",
+} as const;
+
 /** Branch names the built repository exposes under refs/remotes/origin. */
 export const SYNTHETIC = {
+  main: "origin/main",
   develop: "origin/develop",
   active: "origin/feature/ACTIVE-1/partially-shipped",
   absorbed: "origin/bugfix/ABSORBED-1/already-in-develop",
@@ -130,9 +155,10 @@ export async function buildSyntheticRepo(
     await run(path, ["cherry-pick", "--no-edit", sha]);
   }
 
-  // The tool only ever reads refs/remotes/origin, so publish the local branches
-  // there. No remote is involved: nothing here touches the network.
+  // The fixture has no remote, so "pushing" is writing the ref under
+  // refs/remotes/origin by hand. Nothing here touches the network.
   const published: Array<[string, string]> = [
+    ["main", SYNTHETIC.main],
     ["develop", SYNTHETIC.develop],
     ["active", SYNTHETIC.active],
     ["absorbed", SYNTHETIC.absorbed],
@@ -146,6 +172,24 @@ export async function buildSyntheticRepo(
     await run(path, ["update-ref", `refs/remotes/${remote}`, sha]);
   }
 
+  // A branch that exists on origin and nowhere locally — the ordinary case, and
+  // the one whose name collides with the never-pushed branch below.
+  await run(path, [
+    "update-ref",
+    `refs/remotes/${REMOTE}/${SYNTHETIC_SYNC.decoy}`,
+    (await run(path, ["rev-parse", "develop"])).trim(),
+  ]);
+
+  // Committing on release after it was published leaves the local ref ahead of
+  // origin's: the "diverged" shape.
+  await run(path, ["checkout", "-q", "release"]);
+  await commit(path, "release-note.txt", "v1", "chore: not pushed yet");
+
+  // Never published at all: the "local only" shape, and what a worktree branch
+  // looks like before its first push.
+  await run(path, ["checkout", "-q", "-b", SYNTHETIC_SYNC.unpushed, "develop"]);
+  await commit(path, "local-only.txt", "v1", "feat: work that never left this machine");
+
   // What `git clone` records and `git remote set-head` maintains. The tool reads
   // it to learn which branch this repository forks from.
   if (symbolicHead) {
@@ -153,6 +197,14 @@ export async function buildSyntheticRepo(
   }
 
   await run(path, ["checkout", "-q", "main"]);
+
+  // The scaffolding branches are local names that were published under different
+  // ones, so leaving them behind would invent local-only entries the fixture
+  // never meant to describe. A real clone does not carry a local branch for
+  // every remote one either.
+  for (const scratch of ["pre-absorb", "absorbed", "active", "clean", "preprod"]) {
+    await run(path, ["branch", "-q", "-D", scratch]);
+  }
 
   return { path, cleanup: () => rm(base, { recursive: true, force: true }) };
 }

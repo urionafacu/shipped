@@ -31,6 +31,37 @@ same way, because none of them are special.
 The only thing shipped works out on its own is the **base branch**, and it asks
 the repository rather than guessing. See below.
 
+## Local branches, and worktrees
+
+The list covers local branches as well as the ones on `origin`, because a branch
+checked out in a worktree and never pushed is exactly the work most likely to be
+asked about. Before that it was invisible: a fragment naming it would match some
+unrelated branch that happened to share its digits, and answer about that one
+instead.
+
+Branches that need saying something about are marked:
+
+| | meaning |
+|---|---|
+| *(nothing)* | `origin` has it, and any local ref agrees |
+| `· local only` | never pushed — `origin` has no branch by this name |
+| `· local ≠ origin` | a local ref exists and its tip disagrees with `origin`'s |
+
+The two sides then resolve differently, on purpose:
+
+- A **source** prefers the local ref. It is the work in hand, and whatever it
+  carries beyond `origin` is precisely what should show up as missing.
+- A **target** prefers `origin`. A target answers *has this arrived where the
+  team will see it*, and the team sees `origin`. A local copy of a long-lived
+  branch runs behind — measured against one on a real checkout, work that had
+  been in `testing` for weeks read as missing.
+
+A target `origin` has never heard of keeps its `local only` mark, because that
+still changes how to read the answer.
+
+Standing inside a worktree works, and the header names the repository rather than
+the worktree's directory, which is usually named after a branch.
+
 ## Why three states and not a checkmark
 
 `preprod` above holds four of the branch's five commits. A binary present/absent
@@ -217,6 +248,11 @@ machine that has never cloned anything.
 the two branch shapes the design was validated against on a real repository, all
 from fixtures.
 
+The synthetic repository also carries the three ways a local ref can stand
+against `origin`'s — never pushed, ahead of it, identical to it — plus a
+remote-only branch whose name shares a fragment with the never-pushed one, so the
+false match that motivated listing local refs stays covered.
+
 `git-bridge.test.ts` covers the parsers, then runs real git against a repository
 the suite builds in a temp directory — five commits partly cherry-picked into one
 branch, a branch the base absorbed, and a branch merged in cleanly. Its branches
@@ -246,3 +282,12 @@ Tests run with `kittyKeyboard: true`. Under the legacy encoding a lone `Esc`
 so the key never reaches the handler. Special keys are named by OpenTUI's
 `KeyCodes`: `RETURN`, `ESCAPE`, `ARROW_DOWN` — not `ENTER` or `DOWN`, which get
 typed as literal text.
+
+Give the workspace **more branches than fit on screen** whenever a test touches
+layout. The match list draws from a fixed pool of row renderables, and a pool
+taller than its box used to lay the surplus rows out past the bottom border,
+over the status line and the footer — branch names bleeding through the help
+text. With a handful of branches the surplus rows are empty and paint nothing,
+so the whole suite passed while every real repository rendered the bug. The box
+now sets `overflow: "hidden"` and `drawList` asks the laid-out box how many rows
+it can actually show.
