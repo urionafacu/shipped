@@ -193,6 +193,22 @@ both answers the question without a single keystroke.
 
 Both fragments are fuzzy: `517filter` finds `feature/PROJ-517/search-filter-sync`.
 
+Naming only the source lands you on the second step, with the source you asked
+for already settled and shown above the field:
+
+```
+ ✓ source  feature/PROJ-517/search-filter-sync
+
+ ┌─ step 2 of 2 · target branch ──────────────────────┐
+ │ type the branch to check it against                │
+ └────────────────────────────────────────────────────┘
+
+ ┌─ all 411 branches — pick one ──────────────────────┐
+```
+
+The list underneath is every branch the repository has, not the results of a
+search. Type to narrow it, and the title counts what survived.
+
 ### Keys
 
 | Screen | Key | Action |

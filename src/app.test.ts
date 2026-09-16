@@ -8,10 +8,14 @@ import {
   formatAge,
   freshnessLabel,
   fuzzyMatch,
+  listTitle,
   noMissingReason,
   rankBranches,
   shortSha,
+  sourceLine,
   stateGlyph,
+  stepPlaceholder,
+  stepTitle,
   summarize,
   syncNote,
   syncTag,
@@ -316,6 +320,64 @@ describe("shortSha", () => {
   });
 });
 
+describe("stepTitle", () => {
+  test("numbers the steps, because the two screens look alike", () => {
+    expect(stepTitle("source")).toContain("1 of 2");
+    expect(stepTitle("target")).toContain("2 of 2");
+  });
+
+  test("still names which branch each step is asking for", () => {
+    expect(stepTitle("source")).toContain("source branch");
+    expect(stepTitle("target")).toContain("target branch");
+  });
+});
+
+describe("stepPlaceholder", () => {
+  test("differs between the steps, so the prompt shows the question moved on", () => {
+    expect(stepPlaceholder("source")).not.toBe(stepPlaceholder("target"));
+  });
+
+  test("the target prompt says what it will be checked against", () => {
+    expect(stepPlaceholder("target")).toContain("check it against");
+  });
+});
+
+describe("sourceLine", () => {
+  test("names the settled source with a mark that reads as found", () => {
+    const line = sourceLine(branch("feature/PROJ-517/search-filter-sync"));
+
+    expect(line).toContain("✓");
+    expect(line).toContain("source");
+    expect(line).toContain("feature/PROJ-517/search-filter-sync");
+  });
+
+  test("carries the sync mark, so a never-pushed source is not silently trusted", () => {
+    expect(sourceLine(branch("feature/PROJ-901/in-a-worktree", "local-only"))).toContain(
+      "local only",
+    );
+  });
+});
+
+describe("listTitle", () => {
+  test("an unfiltered list is announced as the whole list, not as matches", () => {
+    // The misread this fixes: " matches " over 600 unfiltered branches reads as
+    // the results of a search that found nothing relevant.
+    expect(listTitle("", 654, 654)).toBe(" all 654 branches — pick one ");
+  });
+
+  test("a filtered list reports how many of how many", () => {
+    expect(listTitle("preprod", 3, 654)).toBe(" 3 of 654 branches match ");
+  });
+
+  test("whitespace alone is not a filter", () => {
+    expect(listTitle("   ", 654, 654)).toContain("all 654");
+  });
+
+  test("counts one branch in the singular", () => {
+    expect(listTitle("", 1, 1)).toBe(" all 1 branch — pick one ");
+  });
+});
+
 describe("summarize", () => {
   test("everything present reads as a success, and names the target", () => {
     const [kind, line] = summarize(
@@ -588,6 +650,77 @@ describe("ShippedApp — picking the target", () => {
     expect(frame).toContain("4/5 commits · 1 missing");
   });
 
+  /**
+   * The screen said the tool had failed when it had not. A reader ran
+   * `shipped <fragment>`, the source resolved, and the target step showed an
+   * empty field over hundreds of unfiltered branches with the resolved source
+   * named only in a dim footer line — so they read it as "searched, found
+   * nothing" and reported a bug. Twice.
+   */
+  describe("says the source was found", () => {
+    const lineOf = (frame: string, needle: string) =>
+      frame.split("\n").findIndex((line) => line.includes(needle));
+
+    test("names the resolved source on the target screen", async () => {
+      expect((await pickSource()).captureCharFrame()).toContain(
+        "✓ source  bugfix/PROJ-482-disable-export-actions",
+      );
+    });
+
+    test("puts it above the list, not only in the footer", async () => {
+      // Being present was never the problem; being findable was. The footer sits
+      // at the far end of the screen from where the eye is.
+      const frame = (await pickSource()).captureCharFrame();
+
+      expect(lineOf(frame, "✓ source")).toBeLessThan(lineOf(frame, "target branch"));
+      expect(lineOf(frame, "✓ source")).toBeLessThan(lineOf(frame, "pick one"));
+    });
+
+    test("counts the step, so the second screen is not read as the first", async () => {
+      expect((await pickSource()).captureCharFrame()).toContain("step 2 of 2");
+    });
+
+    test("changes the prompt, so the field does not look untouched", async () => {
+      const frame = (await pickSource()).captureCharFrame();
+
+      expect(frame).toContain("type the branch to check it against");
+      expect(frame).not.toContain("type a branch name, a ticket, or any fragment");
+    });
+
+    test("calls an unfiltered list what it is", async () => {
+      // " matches " over every branch in the repository was the sentence that
+      // read as failure.
+      const frame = (await pickSource()).captureCharFrame();
+
+      expect(frame).toContain("pick one");
+      expect(frame).not.toContain(" matches ");
+    });
+
+    test("counts the matches once a filter narrows them", async () => {
+      const { mockInput, renderOnce, captureCharFrame } = await pickSource();
+
+      await mockInput.pressKeys([..."preprod"]);
+      await renderOnce();
+
+      expect(captureCharFrame()).toContain("1 of 6 branches match");
+    });
+
+    test("claims no source on the first step, where there is none yet", async () => {
+      expect((await mount()).captureCharFrame()).not.toContain("✓ source");
+    });
+
+    test("stops claiming one after esc goes back", async () => {
+      const { mockInput, renderOnce, captureCharFrame } = await pickSource();
+
+      await mockInput.pressKey("ESCAPE");
+      await renderOnce();
+      const frame = captureCharFrame();
+
+      expect(frame).toContain("step 1 of 2");
+      expect(frame).not.toContain("✓ source");
+    });
+  });
+
   test("a target seed matching several branches still asks which one", async () => {
     const { captureCharFrame } = await mount(
       workspace(),
@@ -660,6 +793,22 @@ describe("ShippedApp — the list stays inside its box", () => {
       .find((line) => line.includes("checking"));
 
     expect(status).toContain("checking feature/PROJ-142/some-reasonably-long-branch-name against");
+  });
+
+  test("the source line survives a crowded target list", async () => {
+    // It sits between the header and the box that grows, so an unclipped list
+    // would reach it before it reached the status line.
+    const { mockInput, renderOnce, captureCharFrame } = await mount(crowded());
+
+    await mockInput.pressKeys([..."PROJ-142"]);
+    await mockInput.pressKey("RETURN");
+    await settle();
+    await renderOnce();
+    const line = captureCharFrame()
+      .split("\n")
+      .find((l) => l.includes("✓ source"));
+
+    expect(line).toContain("feature/PROJ-142/some-reasonably-long-branch-name");
   });
 
   test("the box keeps its bottom border", async () => {

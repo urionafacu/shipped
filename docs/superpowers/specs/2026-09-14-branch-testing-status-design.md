@@ -266,8 +266,11 @@ footer, and the help text came out with branch names woven through it.
 ```
  web-client · 412 branches · base origin/develop · fetched 2m ago
 
- ┌─ source branch ──────────────┐        ┌─ target branch ──────────────┐
- │ 517                          │  →     │ prep                         │
+ ┌─ step 1 of 2 · source branch ┐        ✓ source  feature/PROJ-517/search-filter-sync
+ │ 517                          │  →     ┌─ step 2 of 2 · target branch ┐
+ └──────────────────────────────┘        │ prep                         │
+ ┌─ all 412 branches — pick one ┐        └──────────────────────────────┘
+ │ › feature/PROJ-517/search-…  │        ┌─ 2 of 411 branches match ────┐
  └──────────────────────────────┘        └──────────────────────────────┘
 
  source  feature/PROJ-517/search-filter-sync
@@ -281,6 +284,16 @@ footer, and the help text came out with branch names woven through it.
 
  [esc] another target   [b] another source   [r] refetch   [q] quit
 ```
+
+The second step has to say, without being read closely, that the first one
+succeeded. Its field and list look exactly like the first step's, so an empty
+filter over several hundred unfiltered branches reads as a search that found
+nothing — twice, readers concluded the tool had failed to find a branch it had
+in fact already resolved. Four signals carry it now: the settled source named
+above the field rather than only in the footer, a step count in the box title, a
+prompt that differs from the first step's, and a list title that says whether
+the list is everything or the survivors of a filter. Any one of them would have
+prevented the misreading; the footer status line alone did not.
 
 The missing commits are listed on the answer screen rather than behind a
 keypress: there is one verdict now, so there is nothing to select between and

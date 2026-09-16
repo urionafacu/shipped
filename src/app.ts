@@ -95,6 +95,7 @@ export class ShippedApp {
 
   private readonly root: BoxRenderable;
   private readonly subtitleText: TextRenderable;
+  private readonly sourceText: TextRenderable;
   private readonly searchBox: BoxRenderable;
   private readonly searchInput: InputRenderable;
   private readonly listBox: BoxRenderable;
@@ -148,6 +149,20 @@ export class ShippedApp {
     header.add(this.subtitleText);
     this.root.add(header);
 
+    // The answer to "did it find my branch?", directly above the field asking
+    // the next question. It used to live only in the footer status line, a dim
+    // row at the far end of the screen from a list of several hundred branches,
+    // and readers concluded the search had failed.
+    this.sourceText = new TextRenderable(renderer, {
+      id: "source-line",
+      flexShrink: 0,
+      height: 1,
+      fg: theme.ok,
+      attributes: 1,
+      visible: false,
+    });
+    this.root.add(this.sourceText);
+
     this.searchBox = new BoxRenderable(renderer, {
       id: "search",
       flexDirection: "row",
@@ -157,7 +172,7 @@ export class ShippedApp {
       border: true,
       borderColor: theme.borderActive,
       backgroundColor: theme.panel,
-      title: " source branch ",
+      title: stepTitle("source"),
       titleColor: theme.accent,
       paddingX: 1,
       height: 3,
@@ -166,7 +181,7 @@ export class ShippedApp {
       id: "search-input",
       value: seeds.source ?? "",
       flexGrow: 1,
-      placeholder: "type a branch name, a ticket, or any fragment",
+      placeholder: stepPlaceholder("source"),
       textColor: theme.fg,
       cursorColor: theme.accent,
       backgroundColor: theme.panel,
@@ -284,13 +299,30 @@ export class ShippedApp {
     this.subtitleText.content = this.subtitle();
     this.subtitleText.fg = this.workspace.warnings.length > 0 ? theme.warn : theme.dim;
 
-    const picking = this.step !== "result";
+    // Narrowed through a local: the picking flag is a boolean, so it tells the
+    // compiler nothing about which step the renderables belong to.
+    const step = this.step;
+    const picking = step !== "result";
     this.searchBox.visible = picking;
     this.listBox.visible = picking;
     this.resultBox.visible = !picking;
 
-    if (picking) {
-      this.searchBox.title = this.step === "source" ? " source branch " : " target branch ";
+    // Only the target step has a settled source to report; on the first step it
+    // is the question being asked, not an answer.
+    const showSource = step === "target" && this.source !== null;
+    this.sourceText.visible = showSource;
+    if (showSource) this.sourceText.content = sourceLine(this.source!);
+
+    if (step !== "result") {
+      this.searchBox.title = stepTitle(step);
+      this.searchInput.placeholder = stepPlaceholder(step);
+      // Says what the list IS. Titled " matches " over an unfiltered list of
+      // hundreds, it read as the results of a search that had found nothing.
+      this.listBox.title = listTitle(
+        this.searchInput.value,
+        this.matches.length,
+        this.candidates().length,
+      );
       this.drawList();
     } else {
       this.drawResult();
@@ -598,6 +630,38 @@ function claim(key: KeyEvent): void {
 
 export function shortSha(sha: string): string {
   return sha.slice(0, 9);
+}
+
+/**
+ * Which of the two questions is on screen. Numbered because the steps look
+ * alike — same field, same list — and without a count the second one reads as
+ * the first one having failed.
+ */
+export function stepTitle(step: "source" | "target"): string {
+  return step === "source" ? " step 1 of 2 · source branch " : " step 2 of 2 · target branch ";
+}
+
+/** Deliberately different per step: an identical prompt implies nothing moved. */
+export function stepPlaceholder(step: "source" | "target"): string {
+  return step === "source"
+    ? "type a branch name, a ticket, or any fragment"
+    : "type the branch to check it against";
+}
+
+/** The source, settled, in the words the answer screen already uses for it. */
+export function sourceLine(source: BranchRef): string {
+  return `✓ source  ${source.name}${syncTag(source.sync)}`;
+}
+
+/**
+ * Whether the list is everything or the survivors of a filter. With an empty
+ * query it is the full list, and calling that " matches " invited the reading
+ * that a search had run and missed.
+ */
+export function listTitle(query: string, matches: number, total: number): string {
+  const noun = total === 1 ? "branch" : "branches";
+  if (query.trim().length === 0) return ` all ${total} ${noun} — pick one `;
+  return ` ${matches} of ${total} ${noun} match `;
 }
 
 /**
