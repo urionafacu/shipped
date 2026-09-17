@@ -27,6 +27,17 @@
  * It also carries the three ways a local ref can stand against origin's — see
  * SYNTHETIC_SYNC — because a branch that only ever existed locally is invisible
  * under refs/remotes, and that is the common shape in a worktree.
+ *
+ * And it carries the two shapes of a branch the source is built on, which decide
+ * whether a hit is worth listing. `stacked` is an earlier slice of `active`, so
+ * it reports a partial hit forever and is the noise the fold exists to hide;
+ * `mirror` points at the same commit, so it is an ancestor too but its hit is
+ * full — hiding that one would hide an answer.
+ *
+ * Every commit is dated an hour apart in creation order, so tips that were
+ * built later really are newer. The screen orders by that, and a fixture where
+ * everything shared one timestamp could not tell a correct order from a stable
+ * one.
  */
 
 import { mkdtemp, realpath, rm } from "node:fs/promises";
@@ -79,20 +90,36 @@ export const SYNTHETIC = {
   qa: "origin/qa",
   preprod: "origin/preprod",
   release: "origin/release",
+  /** An earlier slice of `active`: an ancestor of it, and a partial hit. */
+  stacked: "origin/feature/ACTIVE-1/earlier-slice",
+  /** The same commit as `active` under another name: an ancestor, and a full hit. */
+  mirror: "origin/feature/ACTIVE-1/same-tip",
 } as const;
 
-async function run(cwd: string, args: string[]): Promise<string> {
-  const result = await Bun.$`git -C ${cwd} ${args}`.quiet().nothrow();
+/** 2026-01-01T00:00:00Z. Fixed so a run's dates never depend on when it ran. */
+const EPOCH = 1_767_225_600;
+let clock = 0;
+
+async function run(cwd: string, args: string[], env?: Record<string, string>): Promise<string> {
+  const shell = env ? Bun.$`git -C ${cwd} ${args}`.env({ ...process.env, ...env }) : Bun.$`git -C ${cwd} ${args}`;
+  const result = await shell.quiet().nothrow();
   if (result.exitCode !== 0) {
     throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString().trim()}`);
   }
   return result.stdout.toString();
 }
 
+/** Each commit an hour after the last, so creation order is also date order. */
+function nextDate(): Record<string, string> {
+  clock += 1;
+  const stamp = `${EPOCH + clock * 3600} +0000`;
+  return { GIT_AUTHOR_DATE: stamp, GIT_COMMITTER_DATE: stamp };
+}
+
 async function commit(cwd: string, file: string, body: string, subject: string): Promise<void> {
   await Bun.write(join(cwd, file), `${body}\n`);
   await run(cwd, ["add", "-A"]);
-  await run(cwd, ["commit", "-q", "-m", subject]);
+  await run(cwd, ["commit", "-q", "-m", subject], nextDate());
 }
 
 /** Is git usable at all? Callers skip rather than fail when it is not. */
@@ -104,6 +131,7 @@ export async function buildSyntheticRepo(
   options: SyntheticOptions = {},
 ): Promise<SyntheticRepo> {
   const { symbolicHead = true } = options;
+  clock = 0;
   // realpath because macOS hands out /var/... from mkdtemp while git reports the
   // resolved /private/var/..., and the two have to compare equal.
   const base = await realpath(await mkdtemp(join(tmpdir(), "shipped-synthetic-")));
@@ -129,7 +157,11 @@ export async function buildSyntheticRepo(
   await run(path, ["checkout", "-q", "-b", "absorbed"]);
   await commit(path, "absorbed.txt", "v1", "fix: the change develop swallowed");
   await run(path, ["checkout", "-q", "develop"]);
-  await run(path, ["merge", "-q", "--no-ff", "absorbed", "-m", "Merge absorbed into develop"]);
+  await run(
+    path,
+    ["merge", "-q", "--no-ff", "absorbed", "-m", "Merge absorbed into develop"],
+    nextDate(),
+  );
 
   await run(path, ["checkout", "-q", "-b", "active", "develop"]);
   for (const n of [1, 2, 3, 4, 5]) {
@@ -143,7 +175,7 @@ export async function buildSyntheticRepo(
   // qa takes `clean` through a real merge commit, which is how most
   // environment branches are actually built — the commits keep their SHAs.
   await run(path, ["checkout", "-q", "-b", "qa", "develop"]);
-  await run(path, ["merge", "-q", "--no-ff", "clean", "-m", "Merge clean into qa"]);
+  await run(path, ["merge", "-q", "--no-ff", "clean", "-m", "Merge clean into qa"], nextDate());
 
   await run(path, ["checkout", "-q", "-b", "release", "develop"]);
 
@@ -152,7 +184,7 @@ export async function buildSyntheticRepo(
   await run(path, ["checkout", "-q", "-b", "preprod", "pre-absorb"]);
   for (const back of [4, 3, 2, 1]) {
     const sha = (await run(path, ["rev-parse", `active~${back}`])).trim();
-    await run(path, ["cherry-pick", "--no-edit", sha]);
+    await run(path, ["cherry-pick", "--no-edit", sha], nextDate());
   }
 
   // The fixture has no remote, so "pushing" is writing the ref under
@@ -166,6 +198,10 @@ export async function buildSyntheticRepo(
     ["qa", SYNTHETIC.qa],
     ["preprod", SYNTHETIC.preprod],
     ["release", SYNTHETIC.release],
+    // Both are ancestors of `active`, which is what the fold keys on — one an
+    // earlier point of it, one the very same commit.
+    ["active~2", SYNTHETIC.stacked],
+    ["active", SYNTHETIC.mirror],
   ];
   for (const [local, remote] of published) {
     const sha = (await run(path, ["rev-parse", local])).trim();

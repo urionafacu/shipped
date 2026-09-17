@@ -14,15 +14,29 @@ import type {
   BranchRef,
   CherryLine,
   CommitRef,
-  Comparison,
   Freshness,
+  Hit,
   Probe,
   RepoContext,
+  ScanSummary,
+  SourceContext,
   Workspace,
 } from "./types";
 
 const REMOTE = "origin";
 const LOCAL_PREFIX = "refs/heads/";
+
+/**
+ * How many targets are compared at once. Each one is its own `git` process.
+ *
+ * Lower than it looks like it should be, and measured rather than guessed. Over
+ * 653 branches of a real repository, raising this hurts both numbers that
+ * matter: at 8 the scan took 6.0s and the first row landed at 0.22s, while at
+ * 24 it took 7.7s and the first row took 1.08s. Past a handful the processes
+ * only contend with each other, and the branches most likely to be the answer —
+ * which are scanned first — are the ones made to wait.
+ */
+export const SCAN_CONCURRENCY = 8;
 
 export class GitError extends Error {}
 
@@ -65,29 +79,44 @@ export function parseRefList(stdout: string): string[] {
     .filter((line) => line.length > 0 && line !== REMOTE && line !== `${REMOTE}/HEAD`);
 }
 
-/** One ref and the commit it points at, from `%(refname:short) %(objectname)`. */
+/** One ref, the commit it points at, and when that commit landed. */
 export interface RefEntry {
   /** As git printed it: "develop" for a local ref, "origin/develop" for a remote one. */
   ref: string;
   sha: string;
+  /** Epoch seconds of the tip commit. */
+  committedAt: number;
 }
 
 /**
- * A branch name can contain almost anything but a space, and a SHA never does,
- * so splitting on the last space is the one split that cannot be fooled.
+ * Reads `%(refname:short) %(objectname) %(committerdate:unix)`.
+ *
+ * A branch name can contain almost anything but a space, and neither a SHA nor a
+ * timestamp ever does, so peeling the two trailing fields off the right is the
+ * one split that cannot be fooled by the name.
  */
 export function parseRefEntries(stdout: string): RefEntry[] {
   const entries: RefEntry[] = [];
   for (const raw of stdout.split("\n")) {
-    const line = raw.trim();
-    if (line.length === 0) continue;
-    const split = line.lastIndexOf(" ");
-    if (split === -1) continue;
-    const ref = line.slice(0, split).trim();
-    const sha = line.slice(split + 1).trim();
+    // Only the line ending comes off. Trimming the whole line would eat the
+    // trailing space git leaves when it has no date to render, and the field
+    // count is what tells a ref line from anything else on stdout.
+    const line = raw.replace(/\r$/, "");
+    if (line.trim().length === 0) continue;
+
+    const lastSpace = line.lastIndexOf(" ");
+    if (lastSpace === -1) continue;
+    const date = Number(line.slice(lastSpace + 1).trim());
+    const head = line.slice(0, lastSpace).trim();
+
+    const shaSpace = head.lastIndexOf(" ");
+    if (shaSpace === -1) continue;
+    const sha = head.slice(shaSpace + 1).trim();
+    const ref = head.slice(0, shaSpace).trim();
+
     // origin/HEAD is a pointer at another branch, not a branch of its own.
     if (!SHA.test(sha) || ref.length === 0 || ref === REMOTE || ref === `${REMOTE}/HEAD`) continue;
-    entries.push({ ref, sha });
+    entries.push({ ref, sha, committedAt: Number.isFinite(date) ? date : 0 });
   }
   return entries;
 }
@@ -98,12 +127,12 @@ export function branchName(ref: string): string {
 }
 
 /**
- * Merges the local and remote-tracking refs into the one list both pickers read.
+ * Merges the local and remote-tracking refs into one list of branches.
  *
  * Deduplicated by branch name, because `develop` and `origin/develop` are one
  * branch to the person asking. When a local ref disagrees with origin's, the
- * local one wins: it is the work in hand, and whatever it carries beyond origin
- * is precisely what would show up as missing from the target.
+ * local one wins as a *source*: it is the work in hand, and whatever it carries
+ * beyond origin is precisely what would show up as missing from a target.
  */
 export function mergeBranches(local: RefEntry[], remote: RefEntry[]): BranchRef[] {
   const remoteByName = new Map(remote.map((entry) => [branchName(entry.ref), entry]));
@@ -114,15 +143,30 @@ export function mergeBranches(local: RefEntry[], remote: RefEntry[]): BranchRef[
     const here = localByName.get(name);
     const there = remoteByName.get(name);
     const remoteRef = there ? `${REMOTE}/${name}` : null;
+    // The newer of the two tips: whichever ref answers, the branch is as recent
+    // as the most recent thing anyone put on it.
+    const committedAt = Math.max(here?.committedAt ?? 0, there?.committedAt ?? 0);
 
     if (!here) {
-      branches.push({ name, ref: `${REMOTE}/${name}`, remoteRef, sync: "in-sync" });
+      branches.push({ name, ref: `${REMOTE}/${name}`, remoteRef, sync: "in-sync", committedAt });
     } else if (!there) {
-      branches.push({ name, ref: `${LOCAL_PREFIX}${name}`, remoteRef, sync: "local-only" });
+      branches.push({
+        name,
+        ref: `${LOCAL_PREFIX}${name}`,
+        remoteRef,
+        sync: "local-only",
+        committedAt,
+      });
     } else if (here.sha === there.sha) {
-      branches.push({ name, ref: `${REMOTE}/${name}`, remoteRef, sync: "in-sync" });
+      branches.push({ name, ref: `${REMOTE}/${name}`, remoteRef, sync: "in-sync", committedAt });
     } else {
-      branches.push({ name, ref: `${LOCAL_PREFIX}${name}`, remoteRef, sync: "diverged" });
+      branches.push({
+        name,
+        ref: `${LOCAL_PREFIX}${name}`,
+        remoteRef,
+        sync: "diverged",
+        committedAt,
+      });
     }
   }
   return branches.sort((a, b) => a.name.localeCompare(b.name));
@@ -218,7 +262,7 @@ export function mainWorkTree(root: string, commonDir: string): string {
 async function listRefs(repoPath: string, namespace: string): Promise<RefEntry[]> {
   const stdout = await gitOrThrow(repoPath, [
     "for-each-ref",
-    "--format=%(refname:short) %(objectname)",
+    "--format=%(refname:short) %(objectname) %(committerdate:unix)",
     namespace,
   ]);
   return parseRefEntries(stdout);
@@ -235,6 +279,14 @@ export function listRemoteBranches(repoPath: string): Promise<RefEntry[]> {
  */
 export function listLocalBranches(repoPath: string): Promise<RefEntry[]> {
   return listRefs(repoPath, LOCAL_PREFIX);
+}
+
+/** The checked-out branch, or null on a detached HEAD. */
+export async function headBranch(repoPath: string): Promise<string | null> {
+  const result = await git(repoPath, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+  if (!result.ok) return null;
+  const name = result.stdout.trim();
+  return name.length > 0 ? name : null;
 }
 
 export async function refExists(repoPath: string, ref: string): Promise<boolean> {
@@ -300,6 +352,31 @@ export async function isAncestor(
   return result.ok;
 }
 
+/**
+ * Every branch whose tip the source already contains — the source's own past.
+ *
+ * One call for the whole repository rather than one question per branch, which
+ * is what makes it affordable to ask at all. Stacked branches land here: a
+ * branch forked off an earlier point of the same work reports a partial hit
+ * forever, and knowing it is behind the source is a fact about the graph rather
+ * than a guess about naming.
+ */
+export async function ancestorNames(
+  repoPath: string,
+  sourceRef: string,
+): Promise<ReadonlySet<string>> {
+  const result = await git(repoPath, [
+    "for-each-ref",
+    "--merged",
+    sourceRef,
+    "--format=%(refname:short)",
+    `refs/remotes/${REMOTE}`,
+    LOCAL_PREFIX,
+  ]);
+  if (!result.ok) return new Set();
+  return new Set(parseRefList(result.stdout).map(branchName));
+}
+
 // --- orchestration ---------------------------------------------------------
 
 /**
@@ -329,9 +406,10 @@ export async function loadWorkspace(cwd: string, fetch = true): Promise<Workspac
     : { fetchedAt: null, stale: true };
   if (freshness.error) warnings.push(`fetch failed — ${freshness.error}`);
 
-  const [remote, local] = await Promise.all([
+  const [remote, local, head] = await Promise.all([
     listRemoteBranches(repo.root),
     listLocalBranches(repo.root),
+    headBranch(repo.root),
   ]);
 
   // The base ref stays a remote-tracking one on purpose: it is the shared point
@@ -343,34 +421,103 @@ export async function loadWorkspace(cwd: string, fetch = true): Promise<Workspac
     repo,
     baseRef,
     branches: mergeBranches(local, remote),
+    head,
     freshness,
     warnings,
   };
 }
 
 /**
- * Answers one question: did the source branch's work reach the target branch?
+ * Everything about the source that every target reuses: its own commits, which
+ * comparison its shape calls for, and what it is already built on.
  *
- * Both branches come from the repository's own ref list, so neither side is
- * assumed to exist or assumed to be named anything in particular.
+ * Hoisted out of the per-target work because it does not vary with the target,
+ * and a scan asks about every branch in the repository.
  */
-export async function compare(
+export async function prepareSource(
   source: BranchRef,
-  requested: BranchRef,
   workspace: Workspace,
-): Promise<Comparison> {
+): Promise<SourceContext> {
   const { root } = workspace.repo;
   const { baseRef } = workspace;
+  const [own, ancestors] = await Promise.all([
+    ownCommits(root, source.ref, baseRef),
+    ancestorNames(root, source.ref),
+  ]);
+  return { source, baseRef, own, strategy: chooseStrategy(own, false), ancestors };
+}
+
+/** Did the source's work reach this one branch, and is this branch behind it? */
+export async function probeTarget(
+  context: SourceContext,
+  requested: BranchRef,
+  repoRoot: string,
+): Promise<Hit> {
   // The two sides resolve differently on purpose: see resolveTarget.
   const target = resolveTarget(requested);
-
-  const own = await ownCommits(root, source.ref, baseRef);
-  const strategy = chooseStrategy(own, false);
+  const { source, baseRef, own, strategy } = context;
 
   const probe: Probe =
     strategy === "cherry"
-      ? { cherry: await cherry(root, target.ref, source.ref, baseRef) }
-      : { containsBranch: await isAncestor(root, source.ref, target.ref) };
+      ? { cherry: await cherry(repoRoot, target.ref, source.ref, baseRef) }
+      : { containsBranch: await isAncestor(repoRoot, source.ref, target.ref) };
 
-  return { source, target, strategy, own, baseRef, verdict: detect({ strategy, own, probe }) };
+  return {
+    target,
+    verdict: detect({ strategy, own, probe }),
+    ancestor: context.ancestors.has(requested.name),
+  };
+}
+
+/** Newest tip first — see BranchRef.committedAt for why that is the ordering. */
+export function byRecency(branches: readonly BranchRef[]): BranchRef[] {
+  return [...branches].sort((a, b) => b.committedAt - a.committedAt || a.name.localeCompare(b.name));
+}
+
+export interface ScanHandlers {
+  /** Called once per branch that carries at least one of the source's commits. */
+  onHit(hit: Hit): void;
+  /** Called after every branch, hit or not, so the header can count up. */
+  onProgress(scanned: number, total: number): void;
+}
+
+/**
+ * Compares the source against every branch the repository has.
+ *
+ * Nobody is asked which branches to check: the question is "where is this work",
+ * and the repository already knows every place it could be. Scanning newest-tip
+ * first means the branches most likely to be the answer resolve in the first
+ * few hundred milliseconds, and since that is also the order the screen lists
+ * them in, rows land at the bottom instead of shuffling what is already read.
+ */
+export async function scanTargets(
+  source: BranchRef,
+  workspace: Workspace,
+  handlers: ScanHandlers,
+  concurrency = SCAN_CONCURRENCY,
+): Promise<ScanSummary> {
+  const { root } = workspace.repo;
+  const context = await prepareSource(source, workspace);
+
+  // Comparing a branch against itself is always trivially "full", so it is never
+  // the question being asked.
+  const targets = byRecency(workspace.branches.filter((b) => b.name !== source.name));
+
+  let next = 0;
+  let scanned = 0;
+  let absent = 0;
+
+  const worker = async (): Promise<void> => {
+    while (next < targets.length) {
+      const target = targets[next++]!;
+      const hit = await probeTarget(context, target, root);
+      scanned += 1;
+      if (hit.verdict.state === "absent") absent += 1;
+      else handlers.onHit(hit);
+      handlers.onProgress(scanned, targets.length);
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, targets.length) }, worker));
+  return { context, scanned, absent };
 }

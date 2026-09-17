@@ -4,45 +4,58 @@ import type { CliRenderer } from "@opentui/core";
 
 import {
   ShippedApp,
-  describeVerdict,
+  builtOn,
+  chooseRow,
+  describeRatio,
+  expansionLines,
   formatAge,
   freshnessLabel,
   fuzzyMatch,
-  listTitle,
-  noMissingReason,
+  hitRow,
+  originLabel,
   rankBranches,
+  relativeDay,
+  resolveSource,
   shortSha,
-  sourceLine,
-  stateGlyph,
-  stepPlaceholder,
-  stepTitle,
-  summarize,
-  syncNote,
   syncTag,
+  truncate,
   type AppDeps,
   type Seeds,
 } from "./app";
-import { GitError } from "./git-bridge";
-import type { BranchRef, Comparison, SyncState, Verdict, Workspace } from "./types";
+import { GitError, type ScanHandlers } from "./git-bridge";
+import type {
+  BranchRef,
+  CommitRef,
+  Hit,
+  ScanSummary,
+  SourceContext,
+  SyncState,
+  Verdict,
+  Workspace,
+} from "./types";
 
 const mounted: { renderer: CliRenderer; app: ShippedApp }[] = [];
 
 afterEach(() => {
   // Each mount attaches listeners to shared terminal singletons; without this
   // the suite drowns in EventTarget max-listener warnings. dispose() first so an
-  // in-flight refetch cannot come back and touch a destroyed renderable.
+  // in-flight scan cannot come back and touch a destroyed renderable.
   for (const { renderer, app } of mounted.splice(0)) {
     app.dispose();
     renderer.destroy();
   }
 });
 
-function branch(name: string, sync: SyncState = "in-sync"): BranchRef {
+const DAY = 86_400;
+const NOW = 1_780_000_000_000;
+
+function branch(name: string, sync: SyncState = "in-sync", daysOld = 1): BranchRef {
   return {
     name,
     ref: sync === "in-sync" ? `origin/${name}` : `refs/heads/${name}`,
     remoteRef: sync === "local-only" ? null : `origin/${name}`,
     sync,
+    committedAt: Math.floor(NOW / 1000) - daysOld * DAY,
   };
 }
 
@@ -50,29 +63,7 @@ function verdict(overrides: Partial<Verdict> = {}): Verdict {
   return { state: "absent", present: 0, total: 5, missing: [], approximate: false, ...overrides };
 }
 
-function workspace(overrides: Partial<Workspace> = {}): Workspace {
-  return {
-    repo: { root: "/work/web-client", name: "web-client", worktree: false },
-    baseRef: "origin/develop",
-    branches: [
-      branch("feature/PROJ-517/search-filter-sync"),
-      branch("bugfix/PROJ-482-disable-export-actions"),
-      branch("feature/PROJ-533/inline-preview-flag"),
-      branch("develop"),
-      branch("preprod"),
-      branch("qa"),
-      branch("release"),
-    ],
-    freshness: { fetchedAt: Date.now(), stale: false },
-    warnings: [],
-    ...overrides,
-  };
-}
-
-const SOURCE = branch("bugfix/PROJ-482-disable-export-actions");
-const TARGET = branch("preprod");
-
-const OWN = [
+const OWN: CommitRef[] = [
   { sha: "1b9e42a7c05f38d6ea71b0c94d2f8563ae017b4d", subject: "fix(web): only hide export actions" },
   { sha: "7c40de915b62a8f30d5c19e7b84a2610fd3b7982", subject: "fix(web): close the empty filter menu" },
   { sha: "5e83b1fa7d094c26b8e5310af7629d04c1b8e735", subject: "test(web): drop any from the mocks" },
@@ -80,39 +71,64 @@ const OWN = [
   { sha: "f04c9b28e17a5d306cb98241e7f350ad6b2c9e81", subject: "docs(web): note which PROJ-482 cases" },
 ];
 
-function comparison(overrides: Partial<Comparison> = {}): Comparison {
+const SOURCE = branch("bugfix/PROJ-482-disable-export-actions", "in-sync", 0);
+
+function workspace(overrides: Partial<Workspace> = {}): Workspace {
   return {
-    source: SOURCE,
-    target: TARGET,
-    strategy: "cherry",
+    repo: { root: "/work/web-client", name: "web-client", worktree: false },
     baseRef: "origin/develop",
-    own: OWN,
-    verdict: verdict(),
+    branches: [
+      SOURCE,
+      branch("feature/PROJ-517/search-filter-sync", "in-sync", 30),
+      branch("feature/PROJ-533/inline-preview-flag", "in-sync", 12),
+      branch("develop", "in-sync", 2),
+      branch("preprod", "in-sync", 7),
+      branch("qa", "in-sync", 0),
+      branch("release", "in-sync", 40),
+    ],
+    head: "bugfix/PROJ-482-disable-export-actions",
+    freshness: { fetchedAt: Date.now(), stale: false },
+    warnings: [],
     ...overrides,
   };
 }
 
-/** The branch shape the design was validated against: four of five arrived. */
-function validatedPartial(): Comparison {
-  return comparison({
-    verdict: verdict({ state: "partial", present: 4, total: 5, missing: [OWN[4]!] }),
-  });
+function context(overrides: Partial<SourceContext> = {}): SourceContext {
+  return {
+    source: SOURCE,
+    baseRef: "origin/develop",
+    own: OWN,
+    strategy: "cherry",
+    ancestors: new Set<string>(),
+    ...overrides,
+  };
 }
 
-/** The other validated shape: the base absorbed it, so only all-or-nothing is knowable. */
-function validatedAbsorbed(): Comparison {
-  return comparison({
-    strategy: "ancestry",
-    own: [],
-    verdict: verdict({ state: "full", present: 0, total: 0, approximate: true }),
-  });
+function hit(name: string, v: Partial<Verdict>, opts: { days?: number; ancestor?: boolean } = {}): Hit {
+  return {
+    target: branch(name, "in-sync", opts.days ?? 1),
+    verdict: verdict(v),
+    ancestor: opts.ancestor ?? false,
+  };
 }
+
+/** The shape the design was validated against: four of five arrived. */
+const PARTIAL = hit("qa", { state: "partial", present: 4, total: 5, missing: [OWN[4]!] }, { days: 0 });
 
 /**
- * kittyKeyboard makes a bare Escape arrive as an unambiguous "escape" key. With
- * the legacy encoding a lone \x1b is held back by the parser waiting to see if
- * it starts a CSI sequence, so the key never reaches the handler in tests.
+ * A scan driven from fixtures: it reports the hits it was handed and then the
+ * summary, the same way the real one streams.
  */
+function scanOf(hits: Hit[], summary: Partial<ScanSummary> = {}): NonNullable<AppDeps["scan"]> {
+  return async (_source, _ws, handlers: ScanHandlers) => {
+    for (const [i, h] of hits.entries()) {
+      handlers.onHit(h);
+      handlers.onProgress(i + 1, 6);
+    }
+    return { context: context(), scanned: 6, absent: 6 - hits.length, ...summary };
+  };
+}
+
 async function mount(ws: Workspace = workspace(), seeds: Seeds = {}, deps: AppDeps = {}) {
   const setup = await createTestRenderer({ width: 110, height: 30, kittyKeyboard: true });
   const app = new ShippedApp(setup.renderer, ws, seeds, deps);
@@ -122,849 +138,518 @@ async function mount(ws: Workspace = workspace(), seeds: Seeds = {}, deps: AppDe
 }
 
 /**
- * Key handlers that reach git are async, and the renderer does not await them.
- * Let the microtask queue drain before reading the frame, or the assertion
- * races the "… checking" placeholder.
+ * The scan is async and the renderer does not await it. Let the microtask queue
+ * drain before reading the frame, or the assertion races the "scanning" state.
  */
 function settle(): Promise<void> {
   return Bun.sleep(0);
 }
 
-/**
- * Walks the whole flow the way a user does: type, enter, type, enter.
- *
- * Typed rather than seeded on purpose. A seed that matches exactly one branch
- * skips its picker, which is a different path with its own test — seeding here
- * would stop exercising the keyboard at all.
- */
-async function openResult(deps: AppDeps, ws: Workspace = workspace()) {
-  const setup = await mount(ws, {}, deps);
-  await setup.mockInput.pressKeys([..."482"]);
-  await setup.mockInput.pressKey("RETURN");
-  await settle();
-  await setup.mockInput.pressKeys([..."preprod"]);
-  await setup.mockInput.pressKey("RETURN");
+/** Mounts, lets the scan finish, and returns the settled frame. */
+async function answer(hits: Hit[], ws: Workspace = workspace(), summary: Partial<ScanSummary> = {}) {
+  const setup = await mount(ws, {}, { scan: scanOf(hits, summary) });
   await settle();
   await setup.renderOnce();
   return setup;
 }
 
+const lineWith = (frame: string, needle: string) =>
+  frame.split("\n").find((line) => line.includes(needle)) ?? "";
+
 describe("fuzzyMatch", () => {
-  test("an empty query matches everything", () => {
-    expect(fuzzyMatch("", "anything")).toBe(true);
+  test("matches a contiguous fragment", () => {
+    expect(fuzzyMatch("517", "feature/PROJ-517/search-filter-sync")).toBe(true);
   });
 
-  test("matches a plain substring", () => {
-    expect(fuzzyMatch("filter", "feature/PROJ-517/search-filter-sync")).toBe(true);
-  });
-
-  test("matches a scattered subsequence", () => {
+  test("matches characters spread across the name", () => {
     expect(fuzzyMatch("517filter", "feature/PROJ-517/search-filter-sync")).toBe(true);
   });
 
-  test("ignores case", () => {
-    expect(fuzzyMatch("PROJ", "feature/proj-517/search-filter-sync")).toBe(true);
-  });
-
-  test("rejects characters that are not there", () => {
-    expect(fuzzyMatch("zzz", "feature/PROJ-517/search-filter-sync")).toBe(false);
-  });
-
-  test("respects order", () => {
+  test("rejects a fragment whose characters are out of order", () => {
     expect(fuzzyMatch("syncfilter", "feature/PROJ-517/search-filter-sync")).toBe(false);
+  });
+
+  test("ignores case", () => {
+    expect(fuzzyMatch("SEARCH", "feature/PROJ-517/search-filter-sync")).toBe(true);
+  });
+
+  test("an empty query matches everything", () => {
+    expect(fuzzyMatch("", "anything")).toBe(true);
   });
 });
 
 describe("rankBranches", () => {
-  const all = [
-    branch("feature/PROJ-517/search-filter-sync"),
-    branch("bugfix/PROJ-482-disable-export-actions"),
-    branch("feature/PROJ-533/inline-preview-flag"),
-  ];
+  const all = workspace().branches;
 
-  test("an empty query keeps everything, sorted by name", () => {
-    expect(rankBranches("", all).map((b) => b.name)).toEqual([
-      "bugfix/PROJ-482-disable-export-actions",
+  test("keeps only the branches that match", () => {
+    expect(rankBranches("517", all).map((b) => b.name)).toEqual([
       "feature/PROJ-517/search-filter-sync",
-      "feature/PROJ-533/inline-preview-flag",
     ]);
   });
 
-  test("filters by ticket", () => {
-    expect(rankBranches("482", all).map((b) => b.name)).toEqual([
-      "bugfix/PROJ-482-disable-export-actions",
+  test("puts a name that starts with the fragment first", () => {
+    const ranked = rankBranches("qa", [branch("feature/qa-helpers"), branch("qa")]);
+    expect(ranked[0]!.name).toBe("qa");
+  });
+
+  test("returns everything for an empty query", () => {
+    expect(rankBranches("", all)).toHaveLength(all.length);
+  });
+});
+
+describe("resolveSource", () => {
+  test("an exact name wins outright", () => {
+    // Otherwise `shipped develop` would open a picker just because some feature
+    // branch also contains those letters.
+    const ws = workspace({ branches: [branch("develop"), branch("feature/develop-helpers")] });
+    expect(resolveSource("develop", ws).map((b) => b.name)).toEqual(["develop"]);
+  });
+
+  test("a fragment that names one branch resolves to it", () => {
+    expect(resolveSource("517", workspace()).map((b) => b.name)).toEqual([
+      "feature/PROJ-517/search-filter-sync",
     ]);
   });
 
-  test("ranks a contiguous hit above a scattered one", () => {
-    const ranked = rankBranches("filter", all);
-    expect(ranked[0]!.name).toBe("feature/PROJ-517/search-filter-sync");
+  test("an ambiguous fragment returns every candidate", () => {
+    expect(resolveSource("PROJ", workspace()).length).toBeGreaterThan(1);
   });
 
-  test("a query matching nothing yields an empty list rather than an error", () => {
-    expect(rankBranches("zzz", all)).toEqual([]);
-  });
-});
-
-describe("describeVerdict", () => {
-  test("prints the ratio when the commits are countable", () => {
-    expect(
-      describeVerdict(
-        verdict({ state: "partial", present: 4, total: 5, missing: [OWN[4]!] }),
-      ),
-    ).toBe("4/5 commits · 1 missing");
+  test("no fragment means the branch you are standing on", () => {
+    expect(resolveSource("", workspace()).map((b) => b.name)).toEqual([SOURCE.name]);
   });
 
-  test("prints a full ratio", () => {
-    expect(describeVerdict(verdict({ state: "full", present: 11, total: 11 }))).toBe("11/11 commits");
+  test("a detached HEAD resolves to nothing rather than guessing", () => {
+    expect(resolveSource("", workspace({ head: null }))).toEqual([]);
   });
 
-  test("prints a zero ratio when absent", () => {
-    expect(describeVerdict(verdict({ state: "absent", total: 11 }))).toBe("0/11 commits");
-  });
-
-  test("invents no ratio on the ancestry path", () => {
-    // present/total are 0 there; printing "0/0 commits" would be a lie.
-    expect(
-      describeVerdict(verdict({ state: "full", approximate: true, present: 0, total: 0 })),
-    ).toBe("the whole branch is here");
-    expect(
-      describeVerdict(verdict({ state: "absent", approximate: true, present: 0, total: 0 })),
-    ).toBe("the branch has not arrived");
+  test("a fragment that names nothing resolves to nothing", () => {
+    expect(resolveSource("no-such-branch", workspace())).toEqual([]);
   });
 });
 
-describe("stateGlyph", () => {
-  test("gives each state its own mark", () => {
-    const glyphs = (["full", "partial", "absent"] as const).map(stateGlyph);
-    expect(glyphs).toEqual(["✓", "◐", "✗"]);
-    expect(new Set(glyphs).size).toBe(3);
+describe("builtOn", () => {
+  test("folds a partial hit the source already contains", () => {
+    // A stacked branch forked off an earlier point of the same work reports a
+    // partial hit forever. It is where the work came from, not where it went.
+    expect(builtOn(hit("earlier", { state: "partial", present: 3 }, { ancestor: true }))).toBe(true);
+  });
+
+  test("never folds a full hit, even one the source contains", () => {
+    // Merging into a branch and then rebasing onto it leaves it an ancestor
+    // too. Folding by ancestry alone would hide the answer.
+    expect(builtOn(hit("qa", { state: "full", present: 5 }, { ancestor: true }))).toBe(false);
+  });
+
+  test("never folds a branch the source was not built on", () => {
+    expect(builtOn(hit("preprod", { state: "partial", present: 4 }))).toBe(false);
   });
 });
 
-describe("noMissingReason", () => {
-  test("explains an empty list on the ancestry path", () => {
-    expect(noMissingReason(verdict({ approximate: true }), "origin/develop")).toContain(
-      "origin/develop absorbed",
+describe("describeRatio", () => {
+  test("counts what arrived against what there was", () => {
+    expect(describeRatio(verdict({ present: 4, total: 5 }))).toBe("4/5");
+  });
+
+  test("says it in words when there is no honest count", () => {
+    // On the ancestry path git cannot tell which commits were the branch's, so
+    // a ratio would be invented.
+    expect(describeRatio(verdict({ state: "full", approximate: true }))).toBe("all of it");
+    expect(describeRatio(verdict({ state: "absent", approximate: true }))).toBe("none");
+  });
+});
+
+describe("relativeDay", () => {
+  test("calls anything from the last day today", () => {
+    expect(relativeDay(Math.floor(NOW / 1000) - 3600, NOW)).toBe("today");
+  });
+
+  test("counts whole days after that", () => {
+    expect(relativeDay(Math.floor(NOW / 1000) - 7 * DAY, NOW)).toBe("7d");
+  });
+});
+
+describe("truncate", () => {
+  test("leaves a name that fits alone", () => {
+    expect(truncate("qa", 10)).toBe("qa");
+  });
+
+  test("marks a name it had to cut", () => {
+    expect(truncate("feature/PROJ-517/search-filter-sync", 10)).toBe("feature/P…");
+  });
+});
+
+describe("originLabel", () => {
+  test("counts the commits the ratios are measured against", () => {
+    expect(originLabel(context(), "origin/develop")).toBe("5 commits vs origin/develop");
+  });
+
+  test("says so when the base already absorbed the branch", () => {
+    expect(originLabel(context({ strategy: "ancestry", own: [] }), "origin/develop")).toBe(
+      "absorbed by origin/develop",
     );
   });
 
-  test("says nothing is missing otherwise", () => {
-    expect(noMissingReason(verdict({ state: "full" }))).toBe("nothing missing");
+  test("names the base before any scan has run", () => {
+    expect(originLabel(null, "origin/main")).toBe("vs origin/main");
   });
 });
 
-describe("formatAge", () => {
-  test("counts in the largest unit that still reads naturally", () => {
-    expect(formatAge(5_000)).toBe("5s");
-    expect(formatAge(120_000)).toBe("2m");
-    expect(formatAge(7_200_000)).toBe("2h");
-    expect(formatAge(172_800_000)).toBe("2d");
+describe("hitRow", () => {
+  test("carries the branch, the ratio and the age", () => {
+    const row = hitRow(PARTIAL, false, 60, NOW);
+
+    expect(row).toContain("qa");
+    expect(row).toContain("4/5");
+    expect(row).toContain("today");
   });
 
-  test("never reports a negative age from a clock skew", () => {
-    expect(formatAge(-1000)).toBe("0s");
+  test("marks the selected row", () => {
+    expect(hitRow(PARTIAL, true, 60, NOW).startsWith(" › ")).toBe(true);
+  });
+
+  test("keeps a long name from pushing the ratio off the edge", () => {
+    const long = hit("feature/PROJ-517/a-branch-name-that-will-not-fit-in-the-column", {
+      state: "full",
+      present: 5,
+    });
+    expect(hitRow(long, false, 40, NOW).length).toBeLessThanOrEqual(40);
+  });
+
+  test("says when the branch never left this machine", () => {
+    const local: Hit = { ...PARTIAL, target: branch("qa", "local-only") };
+    expect(hitRow(local, false, 70, NOW)).toContain("local only");
   });
 });
 
-describe("freshnessLabel", () => {
-  const now = 1_000_000;
+describe("chooseRow", () => {
+  test("shows no ratio, because nothing has been compared yet", () => {
+    const row = chooseRow(branch("feature/PROJ-517/search-filter-sync", "in-sync", 30), false, 70, NOW);
 
-  test("reports how long ago the fetch succeeded", () => {
-    expect(freshnessLabel({ fetchedAt: now - 120_000, stale: false }, now)).toBe("fetched 2m ago");
+    expect(row).toContain("feature/PROJ-517/search-filter-sync");
+    expect(row).toContain("30d");
+    expect(row).not.toContain("/5");
+  });
+});
+
+describe("expansionLines", () => {
+  test("names the commits that did not arrive", () => {
+    const lines = expansionLines(PARTIAL);
+
+    expect(lines[0]).toContain("1 missing from origin/qa");
+    expect(lines[1]).toContain("f04c9b28e");
+    expect(lines[1]).toContain("docs(web): note which PROJ-482 cases");
   });
 
-  test("a failed fetch is called stale rather than dated", () => {
-    // A checkmark computed from refs that may be behind is worse than no answer.
-    expect(freshnessLabel({ fetchedAt: null, stale: true, error: "no network" }, now)).toContain(
-      "STALE",
-    );
+  test("says so when nothing is missing", () => {
+    expect(expansionLines(hit("qa", { state: "full", present: 5 }))[0]).toContain("nothing missing");
   });
 
-  test("a skipped fetch is stale too", () => {
-    expect(freshnessLabel({ fetchedAt: null, stale: true }, now)).toContain("STALE");
+  test("explains itself when there is nothing to list", () => {
+    const absorbed = hit("qa", { state: "full", approximate: true, total: 0 });
+    expect(expansionLines(absorbed)[0]).toContain("cannot list its commits");
   });
 });
 
 describe("syncTag", () => {
-  test("stays silent for the ordinary case, so the exceptions stand out", () => {
+  test("says nothing for the ordinary case", () => {
     expect(syncTag("in-sync")).toBe("");
   });
 
-  test("marks a branch origin has never seen", () => {
+  test("flags a branch origin has never seen", () => {
     expect(syncTag("local-only")).toContain("local only");
   });
 
-  test("marks a local ref that disagrees with origin", () => {
-    expect(syncTag("diverged")).toContain("≠");
-  });
-});
-
-describe("syncNote", () => {
-  test("stays silent for the ordinary case", () => {
-    expect(syncNote("in-sync")).toBe("");
-  });
-
-  test("spells out that the branch was never pushed", () => {
-    expect(syncNote("local-only")).toContain("never pushed");
-  });
-
-  test("spells out that the local ref differs", () => {
-    expect(syncNote("diverged")).toContain("differs from origin");
+  test("flags a local ref that disagrees with origin", () => {
+    expect(syncTag("diverged")).toContain("local ≠ origin");
   });
 });
 
 describe("shortSha", () => {
-  test("keeps enough to paste into a git command", () => {
+  test("shortens to something a person can read back", () => {
     expect(shortSha("f04c9b28e17a5d306cb98241e7f350ad6b2c9e81")).toBe("f04c9b28e");
   });
 });
 
-describe("stepTitle", () => {
-  test("numbers the steps, because the two screens look alike", () => {
-    expect(stepTitle("source")).toContain("1 of 2");
-    expect(stepTitle("target")).toContain("2 of 2");
-  });
-
-  test("still names which branch each step is asking for", () => {
-    expect(stepTitle("source")).toContain("source branch");
-    expect(stepTitle("target")).toContain("target branch");
+describe("formatAge", () => {
+  test("counts seconds, then minutes, then hours, then days", () => {
+    expect(formatAge(5_000)).toBe("5s");
+    expect(formatAge(90_000)).toBe("1m");
+    expect(formatAge(3_600_000 * 2)).toBe("2h");
+    expect(formatAge(86_400_000 * 3)).toBe("3d");
   });
 });
 
-describe("stepPlaceholder", () => {
-  test("differs between the steps, so the prompt shows the question moved on", () => {
-    expect(stepPlaceholder("source")).not.toBe(stepPlaceholder("target"));
+describe("freshnessLabel", () => {
+  test("shouts when the refs were never refreshed", () => {
+    expect(freshnessLabel({ fetchedAt: null, stale: true }, NOW)).toBe("refs may be STALE");
   });
 
-  test("the target prompt says what it will be checked against", () => {
-    expect(stepPlaceholder("target")).toContain("check it against");
-  });
-});
-
-describe("sourceLine", () => {
-  test("names the settled source with a mark that reads as found", () => {
-    const line = sourceLine(branch("feature/PROJ-517/search-filter-sync"));
-
-    expect(line).toContain("✓");
-    expect(line).toContain("source");
-    expect(line).toContain("feature/PROJ-517/search-filter-sync");
-  });
-
-  test("carries the sync mark, so a never-pushed source is not silently trusted", () => {
-    expect(sourceLine(branch("feature/PROJ-901/in-a-worktree", "local-only"))).toContain(
-      "local only",
-    );
+  test("otherwise says how old the answer is", () => {
+    expect(freshnessLabel({ fetchedAt: NOW - 5_000, stale: false }, NOW)).toBe("fetched 5s ago");
   });
 });
 
-describe("listTitle", () => {
-  test("an unfiltered list is announced as the whole list, not as matches", () => {
-    // The misread this fixes: " matches " over 600 unfiltered branches reads as
-    // the results of a search that found nothing relevant.
-    expect(listTitle("", 654, 654)).toBe(" all 654 branches — pick one ");
+describe("ShippedApp — the answer arrives without being asked for", () => {
+  test("names the branch it is answering for", async () => {
+    // The question "did it find my branch?" is answered by the largest element
+    // on the screen. It used to live in a dim footer line under a list of every
+    // branch in the repository, and readers concluded the search had failed.
+    const frame = (await answer([PARTIAL])).captureCharFrame();
+
+    expect(frame).toContain("shipped  bugfix/PROJ-482-disable-export-actions");
   });
 
-  test("a filtered list reports how many of how many", () => {
-    expect(listTitle("preprod", 3, 654)).toBe(" 3 of 654 branches match ");
+  test("lists every branch carrying the work, without a target being picked", async () => {
+    const frame = (
+      await answer([PARTIAL, hit("preprod", { state: "full", present: 5 }, { days: 7 })])
+    ).captureCharFrame();
+
+    expect(lineWith(frame, " qa ")).toContain("4/5");
+    expect(lineWith(frame, "preprod")).toContain("5/5");
   });
 
-  test("whitespace alone is not a filter", () => {
-    expect(listTitle("   ", 654, 654)).toContain("all 654");
-  });
+  test("orders the newest tip first", async () => {
+    // Measured on a real repository: ranking by how much of the work arrived
+    // buried the integration branch at position 11 of 14, while ranking by date
+    // put it first.
+    const frame = (
+      await answer([
+        hit("old-feature", { state: "full", present: 5 }, { days: 30 }),
+        hit("qa", { state: "partial", present: 4 }, { days: 0 }),
+      ])
+    ).captureCharFrame();
+    const lines = frame.split("\n");
 
-  test("counts one branch in the singular", () => {
-    expect(listTitle("", 1, 1)).toBe(" all 1 branch — pick one ");
-  });
-});
-
-describe("summarize", () => {
-  test("everything present reads as a success, and names the target", () => {
-    const [kind, line] = summarize(
-      comparison({ verdict: verdict({ state: "full", present: 5, total: 5 }) }),
+    expect(lines.findIndex((l) => l.includes("qa"))).toBeLessThan(
+      lines.findIndex((l) => l.includes("old-feature")),
     );
-    expect(kind).toBe("ok");
-    expect(line).toBe("preprod ✓ 5/5 commits");
   });
 
-  test("a partial warns", () => {
-    expect(summarize(validatedPartial())[0]).toBe("warn");
+  test("counts the branches that do not have it, so the list is not read as truncated", async () => {
+    const frame = (await answer([PARTIAL])).captureCharFrame();
+
+    expect(frame).toContain("5 branches do not have it");
   });
 
-  test("plainly absent is information, not a warning", () => {
-    expect(summarize(comparison())[0]).toBe("info");
-  });
-});
+  test("says how many hits there are next to how many branches were checked", async () => {
+    const frame = (await answer([PARTIAL])).captureCharFrame();
 
-describe("ShippedApp — picking the source", () => {
-  test("lists the branches of the repository it was invoked in", async () => {
-    const frame = (await mount()).captureCharFrame();
-
-    expect(frame).toContain("search-filter-sync");
-    expect(frame).toContain("inline-preview-flag");
+    expect(frame).toContain("where this work is");
+    expect(lineWith(frame, "where this work is")).toContain("1 hit");
   });
 
-  test("names the repository and the base it measures against", async () => {
-    const frame = (await mount()).captureCharFrame();
+  test("counts the commits every ratio is measured against", async () => {
+    const frame = (await answer([PARTIAL])).captureCharFrame();
 
-    expect(frame).toContain("web-client");
-    expect(frame).toContain("base origin/develop");
+    expect(frame).toContain("5 commits vs origin/develop");
   });
 
-  test("asks for the source branch first", async () => {
-    expect((await mount()).captureCharFrame()).toContain("source branch");
+  test("says plainly when the work is nowhere yet", async () => {
+    const frame = (await answer([])).captureCharFrame();
+
+    expect(frame).toContain("nowhere yet");
   });
 
-  test("says nothing extra about a branch that agrees with origin", async () => {
-    const frame = (await mount()).captureCharFrame();
+  test("never asks which branch to compare against", async () => {
+    const frame = (await answer([PARTIAL])).captureCharFrame();
 
-    expect(frame).not.toContain("local only");
-    expect(frame).not.toContain("local ≠ origin");
+    expect(frame).not.toContain("target");
+    expect(frame).not.toContain("step 2");
+    expect(frame).not.toContain("pick one");
   });
 
-  test("marks a branch that was never pushed", async () => {
-    // Otherwise a branch living in a worktree looks exactly like one everyone
-    // else can see.
-    const { captureCharFrame } = await mount(
-      workspace({ branches: [branch("feature/PROJ-901/in-a-worktree", "local-only")] }),
+  test("surfaces a scan that failed instead of dying quietly", async () => {
+    const setup = await mount(
+      workspace(),
+      {},
+      {
+        scan: () => Promise.reject(new GitError("origin/develop is gone")),
+      },
     );
-
-    expect(captureCharFrame()).toContain("local only");
-  });
-
-  test("marks a branch whose local ref has outrun origin", async () => {
-    const { captureCharFrame } = await mount(
-      workspace({ branches: [branch("feature/PROJ-902/committed-not-pushed", "diverged")] }),
-    );
-
-    expect(captureCharFrame()).toContain("local ≠ origin");
-  });
-
-  test("offers a local-only branch that shares a fragment with a remote one", async () => {
-    // The bug, at the UI: searching those digits used to surface only the
-    // unrelated remote branch, because the wanted one had never been pushed.
-    const { mockInput, renderOnce, captureCharFrame } = await mount(
-      workspace({
-        branches: [
-          branch("bugfix/DECOY-11351/unrelated", "in-sync"),
-          branch("feature/LOCAL-1351/mine", "local-only"),
-        ],
-      }),
-    );
-
-    await mockInput.pressKeys([..."1351"]);
-    await renderOnce();
-
-    expect(captureCharFrame()).toContain("LOCAL-1351");
-  });
-
-  test("names the repository, not the worktree, when standing in one", async () => {
-    const { captureCharFrame } = await mount(
-      workspace({ repo: { root: "/work/web-client/.trees/feat", name: "web-client", worktree: true } }),
-    );
-    const frame = captureCharFrame();
-
-    expect(frame).toContain("web-client");
-    expect(frame).toContain("worktree");
-  });
-
-  test("shows how fresh the refs are", async () => {
-    expect((await mount()).captureCharFrame()).toContain("fetched");
-  });
-
-  test("flags stale refs instead of presenting them as authoritative", async () => {
-    const { captureCharFrame } = await mount(
-      workspace({
-        freshness: { fetchedAt: null, stale: true, error: "no network" },
-        warnings: ["fetch failed — no network"],
-      }),
-    );
-
-    expect(captureCharFrame()).toContain("STALE");
-  });
-
-  test("surfaces a warning in the header", async () => {
-    const { captureCharFrame } = await mount(
-      workspace({ warnings: ["fetch failed — no network"] }),
-    );
-    expect(captureCharFrame()).toContain("fetch failed");
-  });
-
-  test("typing filters the list", async () => {
-    const { mockInput, renderOnce, captureCharFrame } = await mount();
-
-    await mockInput.pressKeys(["4", "8", "2"]);
-    await renderOnce();
-    const frame = captureCharFrame();
-
-    expect(frame).toContain("PROJ-482");
-    expect(frame).not.toContain("inline-preview-flag");
-  });
-
-  test("a seed filters before the first paint", async () => {
-    // "feature" on purpose: a seed matching exactly one branch skips this
-    // picker entirely, which is a different path with its own test.
-    const { captureCharFrame } = await mount(workspace(), { source: "feature" });
-    const frame = captureCharFrame();
-
-    expect(frame).toContain("source branch");
-    expect(frame).toContain("inline-preview-flag");
-    expect(frame).toContain("search-filter-sync");
-    expect(frame).not.toContain("preprod");
-  });
-
-  test("a seed matching exactly one branch skips straight to the target picker", async () => {
-    const { captureCharFrame } = await mount(workspace(), { source: "preview" });
     await settle();
+    await setup.renderOnce();
 
-    expect(captureCharFrame()).toContain("target branch");
-  });
-
-  test("a query matching nothing says so instead of erroring", async () => {
-    const { mockInput, renderOnce, captureCharFrame } = await mount();
-
-    await mockInput.pressKeys(["z", "z", "z"]);
-    await renderOnce();
-
-    expect(captureCharFrame()).toContain("no branch matches");
-  });
-
-  test("arrow keys move the selection instead of typing into the filter", async () => {
-    const { mockInput, renderOnce, captureCharFrame } = await mount();
-
-    await mockInput.pressKey("ARROW_DOWN");
-    await renderOnce();
-    const frame = captureCharFrame();
-
-    // The cursor moved to the second row and nothing was typed, so the full
-    // list is still on screen and the filter is still empty.
-    expect(frame).toContain("search-filter-sync");
-    expect(frame).toContain("inline-preview-flag");
-    expect(frame).not.toContain("no branch matches");
-  });
-
-  test("the selection marker follows the arrow keys", async () => {
-    const { mockInput, renderOnce, captureCharFrame } = await mount();
-
-    // Sorted by name, so the bugfix branch is first and develop is second.
-    expect(captureCharFrame()).toContain("› bugfix/PROJ-482");
-
-    await mockInput.pressKey("ARROW_DOWN");
-    await renderOnce();
-    expect(captureCharFrame()).toContain("› develop");
-
-    await mockInput.pressKey("ARROW_UP");
-    await renderOnce();
-    expect(captureCharFrame()).toContain("› bugfix/PROJ-482");
-  });
-
-  test("the cursor stops at the ends of the list", async () => {
-    const { mockInput, renderOnce, captureCharFrame } = await mount();
-
-    await mockInput.pressKeys(["ARROW_UP", "ARROW_UP"]);
-    await renderOnce();
-    expect(captureCharFrame()).toContain("› bugfix/PROJ-482");
-
-    await mockInput.pressKeys(Array(12).fill("ARROW_DOWN"));
-    await renderOnce();
-    expect(captureCharFrame()).toContain("› release");
-  });
-
-  test("esc clears the filter rather than quitting", async () => {
-    const { mockInput, renderOnce, captureCharFrame } = await mount();
-
-    await mockInput.pressKeys(["4", "8", "2"]);
-    await renderOnce();
-    expect(captureCharFrame()).not.toContain("inline-preview-flag");
-
-    await mockInput.pressKey("ESCAPE");
-    await renderOnce();
-    expect(captureCharFrame()).toContain("inline-preview-flag");
-  });
-
-  test("r types into the filter instead of refetching", async () => {
-    // The search field is focused, so a bare `r` has to reach it as text.
-    const { mockInput, renderOnce, captureCharFrame } = await mount();
-
-    await mockInput.pressKey("r");
-    await renderOnce();
-
-    expect(captureCharFrame()).not.toContain("fetching");
+    expect(setup.captureCharFrame()).toContain("origin/develop is gone");
   });
 });
 
-describe("ShippedApp — picking the target", () => {
-  async function pickSource(deps: AppDeps = {}) {
-    const setup = await mount(workspace(), {}, deps);
-    await setup.mockInput.pressKeys([..."482"]);
+describe("ShippedApp — what is missing", () => {
+  test("lists the missing commits under the row, without leaving the screen", async () => {
+    const setup = await answer([PARTIAL]);
+    await setup.mockInput.pressKey("RETURN");
+    await setup.renderOnce();
+    const frame = setup.captureCharFrame();
+
+    expect(frame).toContain("1 missing from origin/qa");
+    expect(frame).toContain("docs(web): note which PROJ-482");
+    // The row it belongs to is still on screen: nothing navigated anywhere.
+    expect(frame).toContain("shipped  bugfix/PROJ-482-disable-export-actions");
+  });
+
+  test("closes again on a second press", async () => {
+    const setup = await answer([PARTIAL]);
+    await setup.mockInput.pressKey("RETURN");
+    await setup.renderOnce();
+    await setup.mockInput.pressKey("RETURN");
+    await setup.renderOnce();
+
+    expect(setup.captureCharFrame()).not.toContain("1 missing from");
+  });
+});
+
+describe("ShippedApp — branches the source was built on", () => {
+  const stacked = hit("feature/PROJ-482-earlier-slice", { state: "partial", present: 2 }, {
+    days: 20,
+    ancestor: true,
+  });
+
+  test("keeps them out of the answer", async () => {
+    const frame = (await answer([PARTIAL, stacked])).captureCharFrame();
+
+    expect(frame).not.toContain("earlier-slice");
+  });
+
+  test("says how many were folded, rather than hiding them silently", async () => {
+    const frame = (await answer([PARTIAL, stacked])).captureCharFrame();
+
+    expect(frame).toContain("1 more your branch was built on");
+    expect(frame).toContain("h to show");
+  });
+
+  test("shows them on demand", async () => {
+    const setup = await answer([PARTIAL, stacked]);
+    await setup.mockInput.pressKey("h");
+    await setup.renderOnce();
+
+    expect(setup.captureCharFrame()).toContain("earlier-slice");
+  });
+
+  test("a full hit is never folded, even when the source contains it", async () => {
+    const mirror = hit("same-tip", { state: "full", present: 5 }, { days: 20, ancestor: true });
+    const frame = (await answer([PARTIAL, mirror])).captureCharFrame();
+
+    expect(frame).toContain("same-tip");
+    expect(frame).not.toContain("your branch was built on");
+  });
+
+  test("does not offer the key when nothing was folded", async () => {
+    const frame = (await answer([PARTIAL])).captureCharFrame();
+
+    expect(frame).not.toContain("built on");
+  });
+});
+
+describe("ShippedApp — choosing between branches", () => {
+  test("an unambiguous fragment goes straight to the answer", async () => {
+    const setup = await mount(workspace(), { source: "517" }, { scan: scanOf([PARTIAL]) });
+    await settle();
+    await setup.renderOnce();
+
+    expect(setup.captureCharFrame()).toContain("where this work is");
+  });
+
+  test("an ambiguous one asks, over the branches it could mean and no others", async () => {
+    const setup = await mount(workspace(), { source: "PROJ" }, { scan: scanOf([PARTIAL]) });
+    await settle();
+    await setup.renderOnce();
+    const frame = setup.captureCharFrame();
+
+    expect(frame).toContain("branches match");
+    expect(frame).toContain("pick the one you mean");
+    // The branches that cannot be meant are not on screen.
+    expect(frame).not.toContain("release");
+  });
+
+  test("picking one answers for it", async () => {
+    const setup = await mount(workspace(), { source: "PROJ" }, { scan: scanOf([PARTIAL]) });
+    await settle();
     await setup.mockInput.pressKey("RETURN");
     await settle();
     await setup.renderOnce();
-    return setup;
-  }
 
-  test("picking a source asks which branch to check it against", async () => {
-    expect((await pickSource()).captureCharFrame()).toContain("target branch");
+    expect(setup.captureCharFrame()).toContain("where this work is");
   });
 
-  test("the target list is the repository's own branches, chosen by nobody", async () => {
-    // Nothing is preselected or ranked ahead: these are simply the branches the
-    // repository has.
-    const frame = (await pickSource()).captureCharFrame();
-
-    expect(frame).toContain("qa");
-    expect(frame).toContain("preprod");
-    expect(frame).toContain("release");
-    expect(frame).toContain("develop");
-  });
-
-  test("the source is not offered as its own target", async () => {
-    // Comparing a branch against itself is always trivially full, so it is never
-    // the question. The status line still names it; the list must not.
-    expect((await pickSource()).captureCharFrame()).not.toContain("› bugfix/PROJ-482");
-  });
-
-  test("esc goes back to the source picker rather than clearing", async () => {
-    const { mockInput, renderOnce, captureCharFrame } = await pickSource();
-
-    await mockInput.pressKey("ESCAPE");
-    await renderOnce();
-    const frame = captureCharFrame();
-
-    expect(frame).toContain("source branch");
-    expect(frame).toContain("› bugfix/PROJ-482");
-  });
-
-  test("naming both branches answers the question with no keystrokes", async () => {
-    // The whole point of the CLI form: `shipped PROJ-482 preprod`.
-    const { captureCharFrame } = await mount(
-      workspace(),
-      { source: "482", target: "preprod" },
-      { compare: async () => validatedPartial() },
-    );
-
+  test("says so when the fragment names nothing", async () => {
+    const setup = await mount(workspace(), { source: "no-such-branch" }, { scan: scanOf([]) });
     await settle();
-    await settle();
-    const frame = captureCharFrame();
+    await setup.renderOnce();
 
-    expect(frame).toContain("4/5 commits · 1 missing");
+    expect(setup.captureCharFrame()).toContain('no branch matches "no-such-branch"');
   });
 
-  /**
-   * The screen said the tool had failed when it had not. A reader ran
-   * `shipped <fragment>`, the source resolved, and the target step showed an
-   * empty field over hundreds of unfiltered branches with the resolved source
-   * named only in a dim footer line — so they read it as "searched, found
-   * nothing" and reported a bug. Twice.
-   */
-  describe("says the source was found", () => {
-    const lineOf = (frame: string, needle: string) =>
-      frame.split("\n").findIndex((line) => line.includes(needle));
+  test("with no fragment it answers for the branch you are standing on", async () => {
+    const frame = (await answer([PARTIAL])).captureCharFrame();
 
-    test("names the resolved source on the target screen", async () => {
-      expect((await pickSource()).captureCharFrame()).toContain(
-        "✓ source  bugfix/PROJ-482-disable-export-actions",
-      );
-    });
-
-    test("puts it above the list, not only in the footer", async () => {
-      // Being present was never the problem; being findable was. The footer sits
-      // at the far end of the screen from where the eye is.
-      const frame = (await pickSource()).captureCharFrame();
-
-      expect(lineOf(frame, "✓ source")).toBeLessThan(lineOf(frame, "target branch"));
-      expect(lineOf(frame, "✓ source")).toBeLessThan(lineOf(frame, "pick one"));
-    });
-
-    test("counts the step, so the second screen is not read as the first", async () => {
-      expect((await pickSource()).captureCharFrame()).toContain("step 2 of 2");
-    });
-
-    test("changes the prompt, so the field does not look untouched", async () => {
-      const frame = (await pickSource()).captureCharFrame();
-
-      expect(frame).toContain("type the branch to check it against");
-      expect(frame).not.toContain("type a branch name, a ticket, or any fragment");
-    });
-
-    test("calls an unfiltered list what it is", async () => {
-      // " matches " over every branch in the repository was the sentence that
-      // read as failure.
-      const frame = (await pickSource()).captureCharFrame();
-
-      expect(frame).toContain("pick one");
-      expect(frame).not.toContain(" matches ");
-    });
-
-    test("counts the matches once a filter narrows them", async () => {
-      const { mockInput, renderOnce, captureCharFrame } = await pickSource();
-
-      await mockInput.pressKeys([..."preprod"]);
-      await renderOnce();
-
-      expect(captureCharFrame()).toContain("1 of 6 branches match");
-    });
-
-    test("claims no source on the first step, where there is none yet", async () => {
-      expect((await mount()).captureCharFrame()).not.toContain("✓ source");
-    });
-
-    test("stops claiming one after esc goes back", async () => {
-      const { mockInput, renderOnce, captureCharFrame } = await pickSource();
-
-      await mockInput.pressKey("ESCAPE");
-      await renderOnce();
-      const frame = captureCharFrame();
-
-      expect(frame).toContain("step 1 of 2");
-      expect(frame).not.toContain("✓ source");
-    });
+    expect(frame).toContain(`shipped  ${SOURCE.name}`);
   });
 
-  test("a target seed matching several branches still asks which one", async () => {
-    const { captureCharFrame } = await mount(
-      workspace(),
-      { source: "482", target: "e" },
-      { compare: async () => validatedPartial() },
-    );
-
+  test("asks which branch when HEAD is detached", async () => {
+    const setup = await mount(workspace({ head: null }), {}, { scan: scanOf([]) });
     await settle();
-    await settle();
-    const frame = captureCharFrame();
+    await setup.renderOnce();
 
-    expect(frame).toContain("target branch");
-    expect(frame).not.toContain("4/5 commits");
+    expect(setup.captureCharFrame()).toContain("detached HEAD");
   });
 });
 
 describe("ShippedApp — the list stays inside its box", () => {
   /**
-   * More branches than the row pool can hold. This is the condition the bug
-   * needed: with a handful of branches the surplus rows are empty and paint
-   * nothing, so every other test in this file passed while a real repository
-   * with hundreds of branches rendered branch names straight over the footer.
+   * More hits than the row pool can hold. This is the condition the overflow bug
+   * needed: with a handful of rows the surplus ones are empty and paint nothing,
+   * so every other test passed while a real repository rendered branch names
+   * straight over the footer.
    */
-  function crowded(): Workspace {
-    const many = Array.from({ length: 60 }, (_, i) =>
-      branch(`feature/PROJ-${100 + i}/some-reasonably-long-branch-name`),
+  function crowded() {
+    return Array.from({ length: 61 }, (_, i) =>
+      hit(`feature/PROJ-${100 + i}/some-reasonably-long-branch-name`, {
+        state: "partial",
+        present: 3,
+      }, { days: i }),
     );
-    return workspace({ branches: [...many, branch("preprod")] });
   }
 
-  const footerOf = (frame: string) =>
-    frame.split("\n").find((line) => line.includes("ctrl+c")) ?? "";
+  const footerOf = (frame: string) => lineWith(frame, "q quit");
 
   test("the footer survives a list longer than the screen", async () => {
-    const frame = (await mount(crowded())).captureCharFrame();
+    const frame = (await answer(crowded())).captureCharFrame();
 
-    expect(footerOf(frame)).toContain("type to filter · ↑/↓ move · enter pick");
+    expect(footerOf(frame)).toContain("enter what is missing");
   });
 
   test("no branch name bleeds into the footer", async () => {
-    const frame = (await mount(crowded())).captureCharFrame();
-
-    expect(footerOf(frame)).not.toContain("PROJ-");
+    expect(footerOf((await answer(crowded())).captureCharFrame())).not.toContain("PROJ-");
   });
 
-  test("the footer survives the move from the source picker to the target one", async () => {
-    // The transition is what the user hit: seeding a source that matches one
-    // branch jumps straight to the target picker, redrawing the whole screen.
-    const { mockInput, renderOnce, captureCharFrame } = await mount(crowded());
+  test("the counted line is not overwritten either", async () => {
+    const frame = (await answer(crowded())).captureCharFrame();
 
-    await mockInput.pressKeys([..."PROJ-142"]);
-    await mockInput.pressKey("RETURN");
-    await settle();
-    await renderOnce();
-    const footer = footerOf(captureCharFrame());
-
-    expect(footer).toContain("type to filter · ↑/↓ move · enter check");
-    expect(footer).not.toContain("PROJ-");
-  });
-
-  test("the status line is not overwritten either", async () => {
-    const { mockInput, renderOnce, captureCharFrame } = await mount(crowded());
-
-    await mockInput.pressKeys([..."PROJ-142"]);
-    await mockInput.pressKey("RETURN");
-    await settle();
-    await renderOnce();
-    const status = captureCharFrame()
-      .split("\n")
-      .find((line) => line.includes("checking"));
-
-    expect(status).toContain("checking feature/PROJ-142/some-reasonably-long-branch-name against");
-  });
-
-  test("the source line survives a crowded target list", async () => {
-    // It sits between the header and the box that grows, so an unclipped list
-    // would reach it before it reached the status line.
-    const { mockInput, renderOnce, captureCharFrame } = await mount(crowded());
-
-    await mockInput.pressKeys([..."PROJ-142"]);
-    await mockInput.pressKey("RETURN");
-    await settle();
-    await renderOnce();
-    const line = captureCharFrame()
-      .split("\n")
-      .find((l) => l.includes("✓ source"));
-
-    expect(line).toContain("feature/PROJ-142/some-reasonably-long-branch-name");
+    expect(lineWith(frame, "do not have it")).not.toContain("PROJ-");
   });
 
   test("the box keeps its bottom border", async () => {
-    // The surplus rows used to paint over it, which is how the overflow showed
-    // up before it reached the footer.
-    const frame = (await mount(crowded())).captureCharFrame();
+    const frame = (await answer(crowded())).captureCharFrame();
     const closing = frame.split("\n").filter((line) => line.includes("└"));
 
     expect(closing.every((line) => !line.includes("PROJ-"))).toBe(true);
   });
-});
 
-describe("ShippedApp — the answer", () => {
-  test("names both branches and the verdict", async () => {
-    const frame = (await openResult({ compare: async () => validatedPartial() })).captureCharFrame();
+  test("the header survives a crowded list", async () => {
+    // It sits above the box that grows, so an unclipped list would reach it
+    // before it reached the footer.
+    const frame = (await answer(crowded())).captureCharFrame();
 
-    expect(frame).toContain("bugfix/PROJ-482-disable-export-actions");
-    expect(frame).toContain("origin/preprod");
-    expect(frame).toContain("◐  4/5 commits · 1 missing");
+    expect(lineWith(frame, "shipped  ")).toContain(SOURCE.name);
   });
 
-  test("the status line answers the question without leaving the keyboard", async () => {
-    const frame = (await openResult({ compare: async () => validatedPartial() })).captureCharFrame();
+  test("scrolls to keep the cursor visible", async () => {
+    const setup = await answer(crowded());
+    for (let i = 0; i < 40; i++) await setup.mockInput.pressKey("DOWN");
+    await setup.renderOnce();
+    const frame = setup.captureCharFrame();
 
-    expect(frame).toContain("preprod ◐ 4/5 commits · 1 missing");
-  });
-
-  test("lists the commits that did not make it", async () => {
-    const frame = (await openResult({ compare: async () => validatedPartial() })).captureCharFrame();
-
-    expect(frame).toContain("missing from origin/preprod");
-    expect(frame).toContain("docs(web): note which PROJ-482");
-    expect(frame).toContain("f04c9b28e");
-  });
-
-  test("says nothing is missing when everything arrived", async () => {
-    const full = comparison({ verdict: verdict({ state: "full", present: 5, total: 5 }) });
-    const frame = (await openResult({ compare: async () => full })).captureCharFrame();
-
-    expect(frame).toContain("✓  5/5 commits");
-    expect(frame).toContain("nothing missing");
-  });
-
-  test("says when the source it answered for was never pushed", async () => {
-    // A ✓ earned against a branch that never left this machine is a different
-    // fact from one earned against origin, and the screen has to say which.
-    const unpushed = comparison({
-      source: branch("bugfix/PROJ-482-disable-export-actions", "local-only"),
-      verdict: verdict({ state: "full", present: 5, total: 5 }),
-    });
-    const frame = (await openResult({ compare: async () => unpushed })).captureCharFrame();
-
-    expect(frame).toContain("never pushed to origin");
-  });
-
-  test("says when the target it answered against exists only locally", async () => {
-    // compare() reads a target from origin whenever origin has one, so the only
-    // way a target ref is local is that origin has never seen the branch.
-    const localTarget = comparison({ target: branch("preprod", "local-only") });
-    const frame = (await openResult({ compare: async () => localTarget })).captureCharFrame();
-
-    expect(frame).toContain("never pushed to origin");
-    expect(frame).toContain("refs/heads/preprod");
-  });
-
-  test("stays quiet when both sides agree with origin", async () => {
-    const frame = (await openResult({ compare: async () => validatedPartial() })).captureCharFrame();
-
-    expect(frame).not.toContain("never pushed");
-    expect(frame).not.toContain("differs from origin");
-  });
-
-  test("an absorbed branch says so and prints no invented ratio", async () => {
-    const frame = (await openResult({ compare: async () => validatedAbsorbed() })).captureCharFrame();
-
-    expect(frame).toContain("already absorbed this branch");
-    expect(frame).toContain("✓  the whole branch is here");
-    expect(frame).not.toContain("0/0 commits");
-  });
-
-  test("explains why an absorbed branch has no commit list", async () => {
-    const frame = (await openResult({ compare: async () => validatedAbsorbed() })).captureCharFrame();
-
-    expect(frame).toContain("absorbed the branch");
-  });
-
-  test("esc asks about another target without re-picking the source", async () => {
-    // The same branch usually gets asked about against several targets in a row.
-    const { mockInput, renderOnce, captureCharFrame } = await openResult({
-      compare: async () => validatedPartial(),
-    });
-    expect(captureCharFrame()).toContain("4/5 commits");
-
-    await mockInput.pressKey("ESCAPE");
-    await renderOnce();
-    const frame = captureCharFrame();
-
-    expect(frame).toContain("target branch");
-    expect(frame).not.toContain("4/5 commits");
-  });
-
-  test("b goes all the way back to the source picker", async () => {
-    const { mockInput, renderOnce, captureCharFrame } = await openResult({
-      compare: async () => validatedPartial(),
-    });
-
-    await mockInput.pressKey("b");
-    await renderOnce();
-    const frame = captureCharFrame();
-
-    expect(frame).toContain("source branch");
-    expect(frame).toContain("› bugfix/PROJ-482");
-  });
-
-  test("r refetches and recomputes the answer", async () => {
-    let calls = 0;
-    const { mockInput, renderOnce, captureCharFrame } = await openResult({
-      compare: async () =>
-        calls++ === 0
-          ? validatedPartial()
-          : comparison({ verdict: verdict({ state: "full", present: 5, total: 5 }) }),
-      reload: async () => workspace(),
-    });
-    expect(captureCharFrame()).toContain("4/5 commits");
-
-    await mockInput.pressKey("r");
-    await settle();
-    await renderOnce();
-    expect(captureCharFrame()).toContain("5/5 commits");
-  });
-
-  test("a git failure lands in the status bar instead of killing the session", async () => {
-    const { captureCharFrame } = await openResult({
-      compare: async () => {
-        throw new GitError("bad object origin/nope");
-      },
-    });
-    const frame = captureCharFrame();
-
-    expect(frame).toContain("bad object origin/nope");
-    // Still on the target picker, still usable.
-    expect(frame).toContain("target branch");
-  });
-
-  test("dispose stops the app from repainting", async () => {
-    // Guards the real failure mode: an async refetch resolving after teardown
-    // and writing into a destroyed TextBuffer.
-    const { mockInput, renderOnce, captureCharFrame, app } = await mount();
-
-    await mockInput.pressKeys(["4", "8", "2"]);
-    await renderOnce();
-    expect(captureCharFrame()).not.toContain("inline-preview-flag");
-
-    app.dispose();
-    await mockInput.pressKey("ESCAPE"); // would clear the filter
-    await renderOnce();
-    expect(captureCharFrame()).not.toContain("inline-preview-flag");
+    expect(frame).toContain("›");
+    expect(footerOf(frame)).not.toContain("PROJ-");
   });
 });

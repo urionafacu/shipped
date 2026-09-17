@@ -3,19 +3,12 @@ import { describe, expect, test } from "bun:test";
 import { USAGE, resolveInvocation } from "./index";
 
 describe("resolveInvocation", () => {
-  test("starts with both pickers empty when called bare", () => {
-    expect(resolveInvocation([])).toEqual({ help: false, source: "", target: "", fetch: true });
+  test("names no branch when called bare, which means the one you are on", () => {
+    expect(resolveInvocation([])).toEqual({ help: false, source: "", fetch: true });
   });
 
-  test("seeds the source picker from the first argument", () => {
-    expect(resolveInvocation(["PROJ-517"])).toMatchObject({ source: "PROJ-517", target: "" });
-  });
-
-  test("seeds both pickers, which answers the question in one command", () => {
-    expect(resolveInvocation(["PROJ-517", "testing"])).toMatchObject({
-      source: "PROJ-517",
-      target: "testing",
-    });
+  test("takes the branch to ask about from the first argument", () => {
+    expect(resolveInvocation(["PROJ-517"])).toMatchObject({ source: "PROJ-517" });
   });
 
   test("recognises both help flags", () => {
@@ -27,21 +20,22 @@ describe("resolveInvocation", () => {
     expect(resolveInvocation(["--no-fetch"]).fetch).toBe(false);
   });
 
-  test("--no-fetch still allows both seeds, wherever it sits", () => {
-    expect(resolveInvocation(["--no-fetch", "PROJ-517", "testing"])).toMatchObject({
+  test("--no-fetch reads the same wherever it sits", () => {
+    expect(resolveInvocation(["--no-fetch", "PROJ-517"])).toMatchObject({
       source: "PROJ-517",
-      target: "testing",
       fetch: false,
     });
-    expect(resolveInvocation(["PROJ-517", "--no-fetch", "testing"])).toMatchObject({
+    expect(resolveInvocation(["PROJ-517", "--no-fetch"])).toMatchObject({
       source: "PROJ-517",
-      target: "testing",
       fetch: false,
     });
   });
 
-  test("ignores a third positional rather than misreading it as a target", () => {
-    expect(resolveInvocation(["a", "b", "c"])).toMatchObject({ source: "a", target: "b" });
+  test("ignores a second positional, since there is no second question to ask", () => {
+    // `shipped A B` used to mean "compare A against B". The target is now the
+    // answer rather than an argument, so a stray word must not silently change
+    // which branch is being asked about.
+    expect(resolveInvocation(["a", "b"])).toMatchObject({ source: "a" });
   });
 
   test("does not treat a branch name as a help flag", () => {
@@ -51,24 +45,30 @@ describe("resolveInvocation", () => {
 
 describe("USAGE", () => {
   test("names the command the way the user actually invokes it", () => {
-    expect(USAGE).toContain("shipped [source] [target]");
+    expect(USAGE).toContain("shipped [branch]");
   });
 
   test("says it runs against the repository you are standing in", () => {
     expect(USAGE).toContain("repository you are standing in");
   });
 
-  test("shows the single-command form", () => {
-    expect(USAGE).toContain("shipped PROJ-517 testing");
+  test("says the branch is optional, because standing on it is the common case", () => {
+    expect(USAGE).toContain("Defaults to the branch you have checked out");
   });
 
   test("documents the fetch opt-out", () => {
     expect(USAGE).toContain("--no-fetch");
   });
 
+  test("asks for no second branch", () => {
+    // The tool no longer has a target to be told about: it finds them.
+    expect(USAGE).not.toContain("[target]");
+    expect(USAGE).not.toContain("compare it against");
+  });
+
   test("promises nothing about how branches are named", () => {
-    // The tool compares whatever two branches it is given. Naming a branch here
-    // would be a default in disguise, and defaults were the whole problem.
+    // Naming a branch here would be a default in disguise, and defaults were
+    // the whole problem.
     for (const leaked of ["testing-us", "us-testing", "testing-dx", "staging"]) {
       expect(USAGE).not.toContain(leaked);
     }

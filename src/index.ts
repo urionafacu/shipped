@@ -6,36 +6,34 @@ import { createCliRenderer } from "@opentui/core";
 import { ShippedApp } from "./app";
 import { assertToolchain, GitError, loadWorkspace } from "./git-bridge";
 
-export const USAGE = `shipped — is this branch's work already in that branch?
+export const USAGE = `shipped — where did this branch's work end up?
 
 usage:
-  shipped [source] [target] [--no-fetch]
+  shipped [branch] [--no-fetch]
 
-  source       fragment of the branch you worked on, e.g. a ticket id.
-  target       fragment of the branch to check it against.
+  branch       fragment of the branch to ask about, e.g. a ticket id.
+               Defaults to the branch you have checked out.
   --no-fetch   skip the startup fetch and answer from the local refs.
                Faster, but the answer is only as fresh as your last fetch.
 
-Runs against the repository you are standing in, worktrees included. Both
-branches are picked from the ones this repository actually has, local ones too —
-nothing is assumed about how you name them. A fragment that matches exactly one
-branch skips its picker, so naming both answers the question in a single command.
+Runs against the repository you are standing in, worktrees included. It compares
+the branch against every other branch this repository has — local ones too — and
+lists the ones carrying its commits, newest first. Nothing is configured and no
+branch name is built in: the repository is asked, never assumed.
 
-A branch that origin has never seen is marked in the list, and so is one whose
-local ref disagrees with origin's.
+The comparison is by patch-id, so work that arrived through a rebase or a
+cherry-pick still counts as present.
 
 examples:
   cd path/to/your/repo && shipped
   shipped PROJ-517
-  shipped PROJ-517 testing
+  shipped PROJ-517 --no-fetch
 `;
 
 export interface Invocation {
   help: boolean;
-  /** Seeds the source picker so a known ticket lands on its branch immediately. */
+  /** Names the branch to ask about. Empty means the checked-out one. */
   source: string;
-  /** Seeds the target picker. */
-  target: string;
   fetch: boolean;
 }
 
@@ -43,11 +41,11 @@ export function resolveInvocation(argv: string[]): Invocation {
   const help = argv.some((arg) => arg === "-h" || arg === "--help");
   const fetch = !argv.includes("--no-fetch");
   const positional = argv.filter((arg) => !arg.startsWith("-"));
-  return { help, source: positional[0] ?? "", target: positional[1] ?? "", fetch };
+  return { help, source: positional[0] ?? "", fetch };
 }
 
 async function main(): Promise<number> {
-  const { help, source, target, fetch } = resolveInvocation(process.argv.slice(2));
+  const { help, source, fetch } = resolveInvocation(process.argv.slice(2));
 
   if (help) {
     process.stdout.write(USAGE);
@@ -63,7 +61,7 @@ async function main(): Promise<number> {
       targetFps: 30,
       backgroundColor: "#0b1220",
     });
-    new ShippedApp(renderer, workspace, { source, target });
+    new ShippedApp(renderer, workspace, { source });
     return 0;
   } catch (error) {
     const known = error instanceof GitError;

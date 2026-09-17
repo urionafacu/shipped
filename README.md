@@ -1,39 +1,61 @@
 # shipped
 
-TUI that answers one question: **is this branch's work already in that branch?**
+TUI that answers one question: **where did this branch's work end up?**
 
-Run it inside any git repository. Pick the branch you worked on, pick the branch
-you want to check it against, read the answer — instead of opening the
-environment and looking for yourself.
+Run it inside any git repository, name a branch or none at all, and it compares
+that branch against every other branch the repository has — then lists the ones
+carrying its commits, newest first. Nothing to pick, nothing to configure.
 
 ```
-┌─ answer ─────────────────────────────────────────────────────────────┐
-│ source  bugfix/PROJ-482-disable-export-actions                       │
-│ target  origin/preprod                                               │
-│ 5 commit(s) of its own vs origin/develop                             │
-│                                                                      │
-│   ◐  4/5 commits · 1 missing                                         │
-│                                                                      │
-│   missing from origin/preprod:                                       │
-│   f04c9b28e  docs(web): note which PROJ-482 cases the US env …       │
-└──────────────────────────────────────────────────────────────────────┘
+ shipped  feature/PROJ-517/search-filter-sync
+ 8 commits vs origin/develop · web-client · fetched 3s ago
+
+  where this work is                             411 branches · 7 hits
+
+ ┌──────────────────────────────────────────────────────────────────┐
+ │  › qa                                            6/8    today    │
+ │    feature/PROJ-533/inline-preview-flag          6/8    7d       │
+ │    preprod                                       8/8    24d      │
+ │    feature/PROJ-482-disable-export-actions       3/8    51d      │
+ │    4 more your branch was built on                   h to show   │
+ └──────────────────────────────────────────────────────────────────┘
+
+  404 branches do not have it
+  ↑/↓ move · enter what is missing · h built on · r refetch · q quit
 ```
 
-When the answer is "no", go merge it yourself — shipped reports, it never writes.
+`Enter` opens the commits that did not make it, under the row:
 
-## It knows nothing about your branches
+```
+ │  › qa                                            6/8    today    │
+ │      2 missing from origin/qa                                    │
+ │      a1b2c3d4e  fix(web): guard the empty filter list            │
+ │      f5e6d7c8b  refactor(web): extract the filter mapper         │
+```
 
-There is no list of environment names in this tool, and nothing to configure.
-Both sides of the comparison are branches you pick out of the ones the repository
-actually has, so `qa`, `preprod`, `release/2024` and `testing-dx` all work the
-same way, because none of them are special.
+When the answer is "not there yet", go merge it yourself — shipped reports, it
+never writes.
 
-The only thing shipped works out on its own is the **base branch**, and it asks
-the repository rather than guessing. See below.
+## It asks nothing and knows nothing about your branches
+
+There is no list of environment names in this tool, nothing to configure, and no
+second branch to choose. `qa`, `preprod`, `release/2024` and `testing-dx` are all
+ordinary branches to it, because none of them are special.
+
+Two things it works out on its own, both by asking the repository rather than
+guessing: the **base branch** (see below), and the **order** — newest tip first.
+
+That order is the one piece of judgement in the screen, and it is a fact about
+how branches are used rather than about their names. A branch the team keeps
+integrating into carries everyone's merges, so its tip is from today; a branch
+someone finished and walked away from froze the day they stopped. Sorting by how
+much of the work arrived was tried instead and measured on a real repository: it
+put the integration branch at position **11 of 14**, below three feature branches
+nobody was asking about. By date it came first.
 
 ## Local branches, and worktrees
 
-The list covers local branches as well as the ones on `origin`, because a branch
+The scan covers local branches as well as the ones on `origin`, because a branch
 checked out in a worktree and never pushed is exactly the work most likely to be
 asked about. Before that it was invisible: a fragment naming it would match some
 unrelated branch that happened to share its digits, and answer about that one
@@ -47,38 +69,61 @@ Branches that need saying something about are marked:
 | `· local only` | never pushed — `origin` has no branch by this name |
 | `· local ≠ origin` | a local ref exists and its tip disagrees with `origin`'s |
 
-The two sides then resolve differently, on purpose:
+The two sides of a comparison then resolve differently, on purpose:
 
-- A **source** prefers the local ref. It is the work in hand, and whatever it
-  carries beyond `origin` is precisely what should show up as missing.
-- A **target** prefers `origin`. A target answers *has this arrived where the
-  team will see it*, and the team sees `origin`. A local copy of a long-lived
-  branch runs behind — measured against one on a real checkout, work that had
-  been in `testing` for weeks read as missing.
+- The **branch you asked about** prefers the local ref. It is the work in hand,
+  and whatever it carries beyond `origin` is precisely what should show up as
+  missing elsewhere.
+- Every **branch it is compared against** prefers `origin`, because the question
+  is *has this arrived where the team will see it*, and the team sees `origin`.
+  A local copy of a long-lived branch runs behind — measured on a real checkout,
+  a local `testing` sat 361 commits behind origin's, and against it 8 of 14
+  recent branches read as absent when their work had been there for weeks.
 
-A target `origin` has never heard of keeps its `local only` mark, because that
+A branch `origin` has never heard of keeps its `local only` mark, because that
 still changes how to read the answer.
 
 Standing inside a worktree works, and the header names the repository rather than
 the worktree's directory, which is usually named after a branch.
 
-## Why three states and not a checkmark
+## Why a ratio and not a checkmark
 
-`preprod` above holds four of the branch's five commits. A binary present/absent
+`qa` above holds six of the branch's eight commits. A binary present/absent
 report would have shown that as **present** and hidden a real gap. That is the
-whole reason this tool exists, so the third state is not a nicety:
+whole reason this tool exists, so the ratio is not decoration — it is the state:
 
 | | meaning |
 |---|---|
-| `✓` | every commit of the branch reached the target |
-| `◐` | some did — the missing ones are listed underneath |
-| `✗` | none did |
+| `8/8` | every commit of the branch reached that branch |
+| `6/8` | some did — `Enter` lists the ones that did not |
+| *(absent)* | none did, and the branch is never listed at all |
+
+Branches with none of the work are counted at the foot of the screen rather than
+listed, so a short list is never mistaken for a truncated one.
+
+### Branches your branch was built on
+
+A branch forked from an earlier point of the same work always holds some of it,
+and will report a partial hit forever. Those are folded away behind `h`, and the
+count says how many.
+
+The test is a fact about the graph, not a guess about names: the branch's tip is
+reachable from your source, so your branch already contains everything it has —
+it is where the work came from, not where it went.
+
+Only **partial** hits fold. Merging into a branch and then rebasing onto it
+leaves that branch an ancestor too, but the hit is then full, and hiding a full
+hit would hide the answer.
 
 ## How it decides
 
 Comparison is by **patch-id** (`git cherry`), not by commit SHA. A rebase or a
 cherry-pick rewrites SHAs, so `git branch --contains` reports a false absence for
-any branch that reached a target through one.
+any branch that got the work through one. This is the whole reason the tool is
+worth running: on a real repository a branch read `9/9` by patch-id while
+`--contains` said it had not arrived at all.
+
+Every branch in the repository goes through this, one at a time:
 
 ```
 own = git log --no-merges <base>..<source>
@@ -91,8 +136,9 @@ own is empty                →  git merge-base --is-ancestor <source> <target>
   originally the branch's, so only all-or-nothing is knowable
 ```
 
-The second path reports `✓` or `✗` and **no ratio**. Printing `0/0 commits` there
-would be inventing a number, so it says what it knows in words instead.
+The second path reports *all of it* or *none*, and **no ratio**. Printing
+`0/0 commits` there would be inventing a number, so it says what it knows in
+words instead.
 
 ### The counting subtlety
 
@@ -182,61 +228,69 @@ rm -rf ~/.local/share/shipped
 ```bash
 cd path/to/your/repo
 
-shipped                   # pick both branches
-shipped PROJ-517          # seed the source picker with a ticket
-shipped PROJ-517 testing  # name both: the answer, in one command
-shipped --no-fetch        # skip the startup fetch, answer from local refs
+shipped                # the branch you are standing on
+shipped PROJ-517       # name one by a fragment of it
+shipped --no-fetch     # skip the startup fetch, answer from local refs
 ```
 
-A fragment that matches exactly one branch skips its picker, which is why naming
-both answers the question without a single keystroke.
+The fragment is fuzzy: `517filter` finds `feature/PROJ-517/search-filter-sync`.
+An exact branch name always wins outright, so `shipped develop` never opens a
+picker just because some feature branch also contains those letters.
 
-Both fragments are fuzzy: `517filter` finds `feature/PROJ-517/search-filter-sync`.
-
-Naming only the source lands you on the second step, with the source you asked
-for already settled and shown above the field:
+A fragment that names more than one branch is the only time shipped asks
+anything, and it asks over the branches it could have meant — not over the whole
+repository:
 
 ```
- ✓ source  feature/PROJ-517/search-filter-sync
+ shipped  7 branches match
+  pick the one you mean
 
- ┌─ step 2 of 2 · target branch ──────────────────────┐
- │ type the branch to check it against                │
- └────────────────────────────────────────────────────┘
-
- ┌─ all 411 branches — pick one ──────────────────────┐
+ ┌──────────────────────────────────────────────────────┐
+ │  › feature/PROJ-517/cleanup                   30d    │
+ │    feature/PROJ-517/domain                    30d    │
+ │    feature/PROJ-517/search-filter-sync         3d    │
+ └──────────────────────────────────────────────────────┘
 ```
-
-The list underneath is every branch the repository has, not the results of a
-search. Type to narrow it, and the title counts what survived.
 
 ### Keys
 
-| Screen | Key | Action |
-|---|---|---|
-| picker | *any text* | filter |
-| picker | `↑` / `↓` | move the selection |
-| picker | `Enter` | pick |
-| picker | `Ctrl+R` | refetch |
-| source | `Esc` | clear the filter |
-| target | `Esc` | back to the source picker |
-| answer | `Esc` | ask about another target, keeping the same source |
-| answer | `b` | back to the source picker |
-| answer | `r` | refetch and recompute |
-| answer | `q` | quit |
-| any | `Ctrl+C` | quit |
+| Key | Action |
+|---|---|
+| `↑` / `↓` | move the selection |
+| `Enter` | open or close the commits that are missing |
+| `h` | show the branches your branch was built on |
+| `r` | refetch and scan again |
+| `q` / `Ctrl+C` | quit |
 
-`Esc` pops one step. On the source picker there is nowhere back to, so it clears
-the filter instead.
+### How long it takes
 
-`Ctrl+R` rather than `r` on the pickers: the filter field is focused there, so a
-bare `r` has to reach it as text.
+The scan compares the branch against every other branch, one `git` process each,
+so it is not instant: **6s over 653 branches** on a real repository. It scans in
+the same order it lists, so the branch most likely to be the answer resolves
+first — the first row lands in about **0.2s** and the rest fill in underneath.
+
+Two things were tried to make it faster and both were measured and rejected:
+
+- **A `git for-each-ref --contains` fast path** (0.05s for the whole repository)
+  answers the SHA-merged case only. On a real branch it returned five rows and
+  left out `testing`, which the patch-id scan finds holding 6 of 8 commits. A
+  70ms screen that looks complete and omits the branch you came for is worse
+  than waiting.
+- **Pruning branches whose tip predates the oldest commit** looked sound and is
+  not: it dropped a real hit, because a branch you cherry-picked *from* holds
+  patch-equivalent commits while its tip stays older than yours.
+
+Raising the number of parallel `git` processes does not help either — past a
+handful they only contend, and the branches scanned first are the ones made to
+wait. Measured over 653 branches: 8 at a time took 6.0s with the first row at
+0.22s; 24 at a time took 7.7s with the first row at 1.08s.
 
 ## Architecture
 
 ```
 install.sh              links the entry point onto PATH
 src/index.ts            entry point, argv, --help
-src/app.ts              the TUI (@opentui/core)
+src/app.ts              the one screen (@opentui/core)
 src/base-ref.ts         how the base branch is discovered — pure
 src/git-bridge.ts       runs git through Bun.$, parses its output
 src/detect.ts           the own/cherry/ancestry algorithm — pure, no I/O
@@ -269,6 +323,12 @@ against `origin`'s — never pushed, ahead of it, identical to it — plus a
 remote-only branch whose name shares a fragment with the never-pushed one, so the
 false match that motivated listing local refs stays covered.
 
+It carries both shapes of a branch the source was built on, too: one forked from
+an earlier point of the same work, which folds, and one sitting on the very same
+commit, which must not. Every commit is dated an hour apart in creation order, so
+a fixture where everything shared one timestamp cannot pass off a stable order as
+a correct one.
+
 `git-bridge.test.ts` covers the parsers, then runs real git against a repository
 the suite builds in a temp directory — five commits partly cherry-picked into one
 branch, a branch the base absorbed, and a branch merged in cleanly. Its branches
@@ -288,8 +348,9 @@ it against the git that is actually installed.
 
 The TUI tests use OpenTUI's test renderer (`@opentui/core/testing`): they mount
 the app with a synthetic workspace, press keys, and assert on the captured
-character frame. The git calls are injected, so the answer screen is driven from
-fixtures rather than needing a clone.
+character frame. The scan is injected, so the answer screen is driven from
+fixtures — including its streaming, since the fake scan reports hits the same way
+the real one does.
 
 ### A detail if you write more tests
 
@@ -299,11 +360,21 @@ so the key never reaches the handler. Special keys are named by OpenTUI's
 `KeyCodes`: `RETURN`, `ESCAPE`, `ARROW_DOWN` — not `ENTER` or `DOWN`, which get
 typed as literal text.
 
-Give the workspace **more branches than fit on screen** whenever a test touches
-layout. The match list draws from a fixed pool of row renderables, and a pool
-taller than its box used to lay the surplus rows out past the bottom border,
-over the status line and the footer — branch names bleeding through the help
-text. With a handful of branches the surplus rows are empty and paint nothing,
-so the whole suite passed while every real repository rendered the bug. The box
-now sets `overflow: "hidden"` and `drawList` asks the laid-out box how many rows
-it can actually show.
+Give the app **more hits than fit on screen** whenever a test touches layout. The
+list draws from a fixed pool of row renderables, and a pool taller than its box
+used to lay the surplus rows out past the bottom border, over the status line and
+the footer — branch names bleeding through the help text. With a handful of rows
+the surplus ones are empty and paint nothing, so the whole suite passed while
+every real repository rendered the bug. The box now sets `overflow: "hidden"` and
+`drawList` asks the laid-out box how many rows it can actually show.
+
+Row *text*, on the other hand, is sized from the terminal and not from the box.
+The first draw happens in the constructor before any layout pass, when every
+renderable still measures zero, and a row built against a width of zero renders
+as `where this work isscanning 0/653` on a real terminal.
+
+One more thing, learned the hard way: **the test renderer cannot stand in for a
+terminal when checking layout.** Piping the real binary's stdout to a file does
+not work either — it flushes one frame and the rest of the session never lands.
+Capturing through a real pty (`pty.fork`) is what finally showed the screen as a
+person sees it.

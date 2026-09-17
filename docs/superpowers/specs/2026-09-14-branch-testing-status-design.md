@@ -3,7 +3,9 @@
 **Date:** 2026-09-14
 **Status:** implemented
 **Revised:** 2026-09-15 — the default target list was removed; both sides of the
-comparison are now chosen by the user. See *Why the approach changed*.
+comparison were chosen by the user.
+**Revised:** 2026-09-17 — the target stopped being a question at all. The tool
+scans every branch and reports where the work is. See *Why the approach changed*.
 
 ## Why the approach changed
 
@@ -31,13 +33,25 @@ branch naming, and it was the same mistake one level down: a repository using
 `qa` and `preprod` got a screen full of nothing, and the `.shipped.json` escape
 hatch was configuration the tool should not have needed.
 
-So the target is now picked the same way the source is: out of the branches the
-repository reports. Nothing is proposed, remembered, ranked or configured. The
-tool compares two branches and says whether one's work is in the other; which
-two is the user's business.
+So the target was picked the same way the source was: out of the branches the
+repository reports, with nothing proposed, remembered or configured.
 
-The detection algorithm below is unchanged by either revision. It never depended
-on which repository it was reading, or on what anything was named.
+A third round found that this had fixed the wrong half. Removing the default
+list was right; turning the target into a **question put to the user** was not.
+The screen that resulted asked "which branch should I compare against?" and
+filled itself with every branch in the repository, while the user's actual
+question was "where is my work?". Twice in a row that screen was read as *the
+tool did not find my branch* — the branch it had found was named on one dim line
+above a list of 576 it had not.
+
+The third option was there all along and neither earlier round took it: do not
+decide for the user, and do not ask the user — **find out**. The repository
+already knows every branch the work could be in, and comparing against all of
+them costs about six seconds. So `shipped PROJ-517` now answers, and the only
+thing it ever asks is which branch a genuinely ambiguous fragment meant.
+
+The detection algorithm below is unchanged by all three revisions. It never
+depended on which repository it was reading, or on what anything was named.
 
 ## Problem
 
@@ -47,14 +61,15 @@ only way to check is to open each environment and look, or to run a series of
 `git` commands by hand. The answer is needed several times a week and the manual
 check is slow enough that it gets skipped.
 
-The question is narrow and concrete: *standing in a repository, given a source
-branch and a target branch, are the source's commits present in the target?*
-When the answer is no, the author merges the branch into that target and pushes.
+The question is narrow and concrete: *standing in a repository, given one
+branch, which other branches already carry its commits?* When the branch QA
+reads is not among them, the author merges it there and pushes.
 
-In practice the same source gets asked about against several targets in sequence
-— the environment QA reads first, then the integration branch, then trunk — which
-is a property of the user's workflow, not of the tool, and is served by making
-the second question cheap to re-ask rather than by guessing the answers.
+Asking it as two questions — a source and then a target — was tried and was
+wrong. The same branch gets asked about against several branches in sequence
+(the environment QA reads, then the integration branch, then trunk), and each
+one cost a decision over a list of hundreds. All three answers fit on one screen
+that needs no decision at all.
 
 ## Scope
 
@@ -142,34 +157,104 @@ fail. If nothing resolves, the tool says so and names `git remote set-head origi
 
 ## Targets
 
-There are none, in the sense of a list this tool holds. The target is a branch
-the user picks from the same list the source is picked from — every branch the
-repository has, local and remote alike.
+There are none, in the sense of a list this tool holds — and none, in the sense
+of something the user names either. Every branch the repository has is compared,
+local and remote alike, and the ones carrying any of the work are the answer.
 
-This is the second revision's whole content, and it is worth being explicit
-about why the alternatives were rejected:
+Every alternative was tried and measured, so it is worth being explicit:
 
-- **A default list** (what the previous version shipped) encodes one team's
-  branch names. It shows empty rows to everyone else, and it is a value
-  judgement the tool has no standing to make.
-- **A config file** (`.shipped.json`, also shipped previously) is configuration
-  the user explicitly did not want, and it has to be committed to repositories
-  that may not be theirs.
-- **Heuristic discovery** was tried and measured: "remote branches with no slash
-  in the name" returned 35 entries on a real repository, including six
-  `snyk-fix-*`, `gh-pages` and a `revert-*-staging`. Useless.
-- **Remembering the last choice** was considered and rejected as state the tool
-  would have to own, invalidate and explain. Seeding both picks from the command
-  line gets the same keystroke savings with nothing persisted.
+- **A default list** (what the first version shipped) encodes one team's branch
+  names. It shows empty rows to everyone else, and it is a value judgement the
+  tool has no standing to make.
+- **A config file** (`.shipped.json`, also shipped once) is configuration the
+  user explicitly did not want, and it has to be committed to repositories that
+  may not be theirs.
+- **Heuristic discovery** was measured: "remote branches with no slash in the
+  name" returned 35 entries on a real repository, including six `snyk-fix-*`,
+  `gh-pages` and a `revert-*-staging`. Useless.
+- **Remembering the last choice** was rejected as state the tool would have to
+  own, invalidate and explain.
+- **Asking the user each time** shipped, and was the mistake this revision
+  undoes. It is not neutral just because it holds no opinion: it moves the work
+  onto the person, over a list of several hundred, every single run.
 
-The cost is one extra choice per run. It is paid back by the CLI form — naming
-both fragments answers the question in a single command — and by the answer
-screen returning to the target picker rather than to the start, since the same
-source is usually asked about against several targets in a row.
+Scanning everything costs about six seconds over 653 branches and returns a
+short answer — 14 hits, the rest never shown. That is affordable, so nobody has
+to be asked.
 
-The base branch is not special here either. It is one of the branches in the
-list, so "is this in develop yet?" is asked exactly the way every other question
-is.
+### Ordering
+
+The one judgement the screen makes, and it is read off the graph rather than off
+the names: **newest tip first**.
+
+A branch the team integrates into receives everyone's merges, so its tip is
+always recent. A branch someone finished and left behind freezes the day its
+author stopped. Since the question is about work pushed days ago, any
+integration branch holding it will be more recent than the finished feature
+branches that also hold it.
+
+Ranking by how much of the work arrived was the obvious alternative and is
+wrong. Measured on a real repository, for a source with 8 own commits:
+
+| by commits present | by tip date |
+|---|---|
+| 1. feature/…/ecg 8/8 (30d) | 1. **testing** 6/8 (3d) |
+| 2. fix/…-mouse-sync 8/8 (24d) | 2. feature/…/stale-drag 6/8 (3d) |
+| 3. fix/…-tool-sync 8/8 (24d) | 3. feature/…-integration 6/8 (7d) |
+| … | … |
+| **7. testing 6/8 (3d)** | |
+
+The branch the user came for sat at position 7 of 12 under the first ordering,
+below three feature branches nobody asked about, and first under the second.
+
+Ordering rather than classifying is deliberate. No cheap, robust, name-free
+classifier for "integration branch" exists — fan-in of reachable tips (109 vs
+106 for a feature branch), fan-in excluding the base (4 vs 5) and merge density
+(a feature branch showed 49 merges per 100 commits against `testing`'s 20) were
+each measured and each failed. An order that is wrong still leaves the row on
+screen two places lower; a classifier that is wrong hides it.
+
+### Branches the source was built on
+
+A branch forked from an earlier point of the same work holds part of it forever
+and crowds the answer. Those are folded behind a key, with a count, when **both**
+hold:
+
+1. the hit is `partial`, and
+2. the branch's tip is reachable from the source (`git for-each-ref --merged`,
+   one call for the whole repository, 0.03s).
+
+The second condition is a fact about the graph, not a guess: if the source
+contains that branch's tip, the source already has everything it has — it is
+where the work came from, not where it went.
+
+The first condition is what makes it safe. Merging into a branch and then
+rebasing onto it leaves that branch an ancestor of the source too, but then the
+hit is `full`, and hiding a `full` hit would hide the answer.
+
+### What was rejected for speed
+
+- **A `git for-each-ref --contains` fast path**, 0.05s for the whole repository,
+  answering the SHA-merged case while the patch-id scan continues. Measured on a
+  real branch it returned five rows and omitted `testing`, which the full scan
+  finds holding 6 of 8 commits. A fast screen that looks complete and lacks the
+  branch the user came for is worse than a slow one — it is a confident false
+  negative. Rejected.
+- **Pruning branches whose tip predates the source's oldest own commit.** Sound
+  in theory, false in practice: it dropped a real hit, because a branch the
+  source cherry-picked *from* holds patch-equivalent commits while its own tip
+  stays older. Rejected.
+- **More parallelism.** Measured over 653 branches, 8 concurrent `git` processes
+  took 6.0s with the first row at 0.22s; 24 took 7.7s with the first row at
+  1.08s. Past a handful they only contend, and the branches scanned first —
+  which are the likeliest answers — are the ones made to wait.
+
+What does work is scanning in the order the screen lists: the likeliest answer
+resolves first, rows append rather than reshuffle, and there is no second,
+provisional state to explain.
+
+The base branch is not special here either. It is one of the branches scanned,
+so "is this in develop yet?" is answered in the same pass as everything else.
 
 ## Detection algorithm
 
@@ -251,65 +336,76 @@ before the first paint is short enough to keep.
 
 ## Interface
 
-Three steps, and the first two are the same widget: a fuzzy filter over the
-branches of the current repository, where substrings of the ticket or of the
-description both match.
+One screen. The branch being asked about is the title; underneath it, the
+branches carrying its commits, newest first.
 
-The match list draws from a fixed pool of row renderables rather than rebuilding
-them per keystroke, which over a few thousand branches is the difference between
-a filter that feels instant and one that does not. The pool is sized from a
+```
+ shipped  feature/PROJ-517/search-filter-sync
+ 8 commits vs origin/develop · web-client · fetched 3s ago
+
+  where this work is                             411 branches · 7 hits
+
+ ┌──────────────────────────────────────────────────────────────────┐
+ │  › qa                                            6/8    today    │
+ │    feature/PROJ-533/inline-preview-flag          6/8    7d       │
+ │    preprod                                       8/8    24d      │
+ │    4 more your branch was built on                   h to show   │
+ └──────────────────────────────────────────────────────────────────┘
+
+  404 branches do not have it
+  ↑/↓ move · enter what is missing · h built on · r refetch · q quit
+```
+
+Points that are decisions rather than taste:
+
+- **The title is the branch.** "Did it find my branch?" has to be answered by the
+  largest thing on the screen. The previous version answered it on one dim line
+  above a list of 576 branches the user had not asked for, and two readers in a
+  row concluded it had found nothing. Size and position beat a checkmark.
+- **The ratio is the state.** `8/8` in green, `6/8` in amber. A separate glyph
+  column would repeat what the numbers already say.
+- **Absent branches are counted, never listed.** Otherwise a 7-row answer among
+  555 branches reads as a truncated list. The count at the foot closes that.
+- **Missing commits expand in place.** With one verdict per row there is nothing
+  to navigate to, and expanding rather than pushing a screen removes the whole
+  navigation stack — and with it the three different meanings `esc` used to have.
+- **Rows append while the scan runs.** Same layout, same order, a counter in the
+  section line. No separate loading screen and no provisional state.
+
+The list draws from a fixed pool of row renderables. The pool is sized from a
 constant, so it must be clipped: `overflow: "hidden"` on the box, and a row count
 taken from the laid-out box rather than from the constant. Without both, a pool
 taller than its box laid the surplus rows out past the bottom border and over the
 footer, and the help text came out with branch names woven through it.
 
+Row *text* is sized from the terminal, not from the box. The first draw happens
+in the constructor before any layout pass, when every renderable still measures
+zero; a row built against a width of zero renders as
+`where this work isscanning 0/653` on a real terminal.
+
+### The one question it still asks
+
+A fragment that names more than one branch is genuinely ambiguous, and only then
+does a picker appear — over the branches it could have meant, not over the
+repository:
+
 ```
- web-client · 412 branches · base origin/develop · fetched 2m ago
-
- ┌─ step 1 of 2 · source branch ┐        ✓ source  feature/PROJ-517/search-filter-sync
- │ 517                          │  →     ┌─ step 2 of 2 · target branch ┐
- └──────────────────────────────┘        │ prep                         │
- ┌─ all 412 branches — pick one ┐        └──────────────────────────────┘
- │ › feature/PROJ-517/search-…  │        ┌─ 2 of 411 branches match ────┐
- └──────────────────────────────┘        └──────────────────────────────┘
-
- source  feature/PROJ-517/search-filter-sync
- target  origin/preprod
- 11 commit(s) of its own vs origin/develop
-
-   ~  8/11 commits · 3 missing
-
-   missing from origin/preprod:
-   2fd26e28e  fix(web): …
-
- [esc] another target   [b] another source   [r] refetch   [q] quit
+ shipped  7 branches match
+  pick the one you mean
 ```
 
-The second step has to say, without being read closely, that the first one
-succeeded. Its field and list look exactly like the first step's, so an empty
-filter over several hundred unfiltered branches reads as a search that found
-nothing — twice, readers concluded the tool had failed to find a branch it had
-in fact already resolved. Four signals carry it now: the settled source named
-above the field rather than only in the footer, a step count in the box title, a
-prompt that differs from the first step's, and a list title that says whether
-the list is everything or the survivors of a filter. Any one of them would have
-prevented the misreading; the footer status line alone did not.
+An exact branch name wins outright, so `shipped develop` never opens a picker
+just because some feature branch contains those letters. With no argument at all
+the question is about the checked-out branch, which is why the tool is being run
+from inside a repository in the first place. A detached HEAD is the one case with
+no answer, and it says so.
 
-The missing commits are listed on the answer screen rather than behind a
-keypress: there is one verdict now, so there is nothing to select between and
-nothing to expand.
+There is no text input anywhere. With a handful of rows there is nothing to
+filter, and removing it removed the `r` / `ctrl+r` split that existed only
+because a focused field was stealing the key.
 
-A fragment that matches exactly one branch skips its picker — the ticket already
-said which branch, so a confirming keypress adds nothing. Seeding both from the
-command line therefore answers the question with no interaction at all, which is
-the form the tool is meant to be used in day to day.
-
-`esc` pops one step rather than returning to the start, because the same source
-is usually asked about against several targets in a row. The source picker has
-nowhere back to, so `esc` clears its filter instead.
-
-The source branch is excluded from the target list. Comparing a branch against
-itself is always trivially full and is never the question.
+The source branch is excluded from the scan. Comparing a branch against itself is
+always trivially full and is never the question.
 
 ## Structure
 
@@ -318,7 +414,7 @@ external tool, and a shared contract.
 
 ```
 src/index.ts            entry point, argv parsing, --help
-src/app.ts              the TUI (@opentui/core)
+src/app.ts              the one screen (@opentui/core)
 src/base-ref.ts         how the base branch is discovered — pure
 src/git-bridge.ts       runs git through Bun.$, parses its output
 src/detect.ts           the own/cherry/ancestry algorithm — pure, no I/O
@@ -336,6 +432,11 @@ process call and every parse, and is the only module that knows git exists.
 the tool works out on its own is where to measure from, decided entirely from
 refs somebody else reported.
 
+The scan lives in `git-bridge.ts` as `scanTargets`, which streams hits through
+callbacks rather than returning a list. The screen therefore has no separate
+loading state to model — it draws whatever it has whenever it is told, and the
+last call happens to be the final one.
+
 ## Error handling
 
 | Condition | Behavior |
@@ -343,13 +444,15 @@ refs somebody else reported.
 | cwd is not inside a git repository | Error naming the directory, plus usage; exit 1 |
 | No base ref can be determined | Error naming `git remote set-head origin -a`; exit 1 |
 | `git fetch` fails | Results still computed from local refs, flagged `STALE` |
-| Branch name matches nothing | Empty filter result, no error |
-| Repository has one branch and no other to compare against | Empty target list; nothing to pick, no error |
-| `git` fails while comparing | Message in the status bar, session stays usable |
+| Fragment matches nothing | Named in the status line, no branches listed |
+| Repository has one branch and nothing to compare it against | "nowhere yet", no error |
+| HEAD is detached and no fragment was given | Says so and asks for a branch |
+| `git` fails mid-scan | Message in the status bar, session stays usable |
+| The branch disappears between a refetch and the rescan | Named in the status bar rather than rescanned against nothing |
 
-A target that "does not exist" is no longer a case: both branches are picked from
-the repository's own ref list, so neither can be absent by the time it is used.
-The `unavailable` state was removed from the model rather than left unreachable.
+A target that "does not exist" is not a case: every branch compared comes from
+the repository's own ref list, so none can be absent by the time it is used. The
+`unavailable` state was removed from the model rather than left unreachable.
 
 ## Testing
 
@@ -363,10 +466,27 @@ The `unavailable` state was removed from the model rather than left unreachable.
   fixture's branches are named `qa` / `preprod` / `release`: nothing in the tool
   knows a branch name, and a fixture named after the author's own environments
   would hide a regression that reintroduced one.
+- The same fixture carries both shapes of a branch the source was built on — one
+  forked from an earlier point, which folds, and one on the very same commit,
+  which must not — and dates every commit an hour apart, so a stable order
+  cannot pass for a correct one.
+- `app.test.ts` drives the screen with an injected scan that streams hits the way
+  the real one does, and sizes its layout cases at 61 rows. Small fixtures hide
+  layout bugs: the row pool overflowed over the footer for weeks while every test
+  passed, because a handful of rows leaves the surplus ones empty.
 - No test reads a checkout it did not create, and none touches the network.
+
+One caveat learned while verifying this revision: **the test renderer cannot
+stand in for a terminal.** Piping the real binary's stdout to a file does not
+work either — one frame flushes and the rest of the session never lands, which
+reads as a screen frozen on "scanning". Capturing through a real pty is what
+showed the screen as a person sees it.
 
 ## Open questions deferred
 
 - Whether the tool should offer to perform the merge and push.
-- Whether asking one source against several targets at once is worth a screen of
-  its own, or whether re-asking from the answer screen is already cheap enough.
+- Whether the six-second scan is worth caching between runs, and what would
+  invalidate the cache honestly.
+- Whether the ordering should ever be switchable. It is one key away from being
+  configurable, and configuration is what this design keeps removing, so the bar
+  is a case where the date order is actually wrong rather than merely different.

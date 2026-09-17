@@ -23,7 +23,7 @@ export interface CommitRef {
 /**
  * How a branch's local ref stands against origin's. Worth saying out loud: an
  * answer computed from a branch that never left the machine is still a true
- * answer, but not the one someone reading `✓` would assume.
+ * answer, but not the one someone reading a full ratio would assume.
  *
  * - `in-sync`     nothing to flag — origin has it, and any local ref agrees
  * - `local-only`  never pushed: origin has no branch by this name
@@ -59,6 +59,15 @@ export interface BranchRef {
    */
   remoteRef: string | null;
   sync: SyncState;
+  /**
+   * Epoch seconds of the tip commit, which is the whole ordering of the answer.
+   *
+   * A branch the team keeps integrating into has a tip from today, because
+   * everyone's merges land on it; a branch someone finished and left behind
+   * freezes the day its author stopped. So the branches worth seeing first sort
+   * themselves to the top without the tool knowing a single branch name.
+   */
+  committedAt: number;
 }
 
 /**
@@ -113,15 +122,39 @@ export interface Verdict {
   approximate: boolean;
 }
 
-/** A verdict plus everything needed to explain how it was reached. */
-export interface Comparison {
-  source: BranchRef;
+/** One branch that carries some of the source's work, and how much of it. */
+export interface Hit {
+  /** The target, already resolved to the ref that answers for it. */
   target: BranchRef;
-  strategy: Strategy;
-  own: CommitRef[];
-  /** The ref the source branch's own commits were measured against. */
-  baseRef: string;
   verdict: Verdict;
+  /**
+   * True when this branch's tip is reachable from the source.
+   *
+   * Then it is not somewhere the work arrived — it is where the work came from.
+   * Stacked branches shared a history with the source before it was finished,
+   * so they report a partial hit forever and crowd out the answer.
+   */
+  ancestor: boolean;
+}
+
+/** Everything about a source branch that every target comparison reuses. */
+export interface SourceContext {
+  source: BranchRef;
+  /** The ref the source's own commits were measured against. */
+  baseRef: string;
+  own: CommitRef[];
+  strategy: Strategy;
+  /** Branch names reachable from the source tip: the source's own past. */
+  ancestors: ReadonlySet<string>;
+}
+
+/** What a completed scan says about the branches that had none of the work. */
+export interface ScanSummary {
+  context: SourceContext;
+  /** How many branches were compared. */
+  scanned: number;
+  /** How many of those carried none of the work, and so were never listed. */
+  absent: number;
 }
 
 /** So the UI can flag an answer computed from refs that may be behind. */
@@ -139,8 +172,10 @@ export interface Workspace {
   repo: RepoContext;
   /** The branch the tool measures a source branch's own commits against. */
   baseRef: string;
-  /** Every branch of this repository, local and remote alike. Both pickers read this. */
+  /** Every branch of this repository, local and remote alike. */
   branches: BranchRef[];
+  /** The branch checked out here, so an argument-free run has something to answer for. */
+  head: string | null;
   freshness: Freshness;
   /** Anything worth saying in the header without failing the session. */
   warnings: string[];

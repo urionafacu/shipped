@@ -1,11 +1,13 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
 import {
+  ancestorNames,
   branchName,
+  byRecency,
   cherry,
-  compare,
   findRepoRoot,
   GitError,
+  headBranch,
   isAncestor,
   listLocalBranches,
   listRemoteBranches,
@@ -17,9 +19,12 @@ import {
   parseCommitLog,
   parseRefEntries,
   parseRefList,
+  prepareSource,
+  probeTarget,
   refExists,
   resolveBaseRef,
   resolveTarget,
+  scanTargets,
   type RefEntry,
 } from "./git-bridge";
 import {
@@ -76,31 +81,39 @@ describe("branchName", () => {
 describe("parseRefEntries", () => {
   const sha = (char: string) => char.repeat(40);
 
-  test("splits each line into ref and commit", () => {
-    const out = `develop ${sha("a")}\norigin/qa ${sha("b")}\n`;
+  test("splits each line into ref, commit and date", () => {
+    const out = `develop ${sha("a")} 100\norigin/qa ${sha("b")} 200\n`;
     expect(parseRefEntries(out)).toEqual([
-      { ref: "develop", sha: sha("a") },
-      { ref: "origin/qa", sha: sha("b") },
+      { ref: "develop", sha: sha("a"), committedAt: 100 },
+      { ref: "origin/qa", sha: sha("b"), committedAt: 200 },
     ]);
   });
 
-  test("keeps a branch name that contains spaces out of the SHA", () => {
-    // git allows almost anything but a space in a ref, yet the split has to be
-    // the last space regardless, since a SHA never contains one.
-    expect(parseRefEntries(`feature/a b ${sha("c")}\n`)).toEqual([
-      { ref: "feature/a b", sha: sha("c") },
+  test("keeps a branch name that contains spaces out of the trailing fields", () => {
+    // git allows almost anything but a space in a ref, yet the two fields have
+    // to peel off the right regardless: neither a SHA nor a timestamp has one.
+    expect(parseRefEntries(`feature/a b ${sha("c")} 300\n`)).toEqual([
+      { ref: "feature/a b", sha: sha("c"), committedAt: 300 },
     ]);
   });
 
   test("drops the origin HEAD pointer however it is spelled", () => {
-    const out = `origin ${sha("a")}\norigin/HEAD ${sha("a")}\norigin/develop ${sha("b")}\n`;
-    expect(parseRefEntries(out)).toEqual([{ ref: "origin/develop", sha: sha("b") }]);
+    const out = `origin ${sha("a")} 1\norigin/HEAD ${sha("a")} 1\norigin/develop ${sha("b")} 2\n`;
+    expect(parseRefEntries(out)).toEqual([
+      { ref: "origin/develop", sha: sha("b"), committedAt: 2 },
+    ]);
   });
 
-  test("skips a line whose trailing field is not a SHA", () => {
-    expect(parseRefEntries(`warning: something git said\ndevelop ${sha("a")}\n`)).toEqual([
-      { ref: "develop", sha: sha("a") },
+  test("skips a line whose SHA field is not a SHA", () => {
+    expect(parseRefEntries(`warning: something git said\ndevelop ${sha("a")} 7\n`)).toEqual([
+      { ref: "develop", sha: sha("a"), committedAt: 7 },
     ]);
+  });
+
+  test("keeps a ref whose date git could not render, rather than losing it", () => {
+    // A branch with no usable date still belongs in the list; it simply sorts
+    // last, which is better than vanishing from the answer.
+    expect(parseRefEntries(`develop ${sha("a")} \n`)[0]).toMatchObject({ ref: "develop" });
   });
 
   test("survives empty output", () => {
@@ -111,32 +124,55 @@ describe("parseRefEntries", () => {
 
 describe("mergeBranches", () => {
   const sha = (char: string) => char.repeat(40);
-  const entry = (ref: string, at: string): RefEntry => ({ ref, sha: sha(at) });
+  const entry = (ref: string, at: string, committedAt = 0): RefEntry => ({
+    ref,
+    sha: sha(at),
+    committedAt,
+  });
 
   test("keeps a branch that exists only on origin", () => {
-    expect(mergeBranches([], [entry("origin/qa", "a")])).toEqual([
-      { name: "qa", ref: "origin/qa", remoteRef: "origin/qa", sync: "in-sync" },
+    expect(mergeBranches([], [entry("origin/qa", "a", 5)])).toEqual([
+      { name: "qa", ref: "origin/qa", remoteRef: "origin/qa", sync: "in-sync", committedAt: 5 },
     ]);
   });
 
   test("keeps a branch that exists only locally, and says so", () => {
-    expect(mergeBranches([entry("feature/x", "a")], [])).toEqual([
-      { name: "feature/x", ref: "refs/heads/feature/x", remoteRef: null, sync: "local-only" },
+    expect(mergeBranches([entry("feature/x", "a", 5)], [])).toEqual([
+      {
+        name: "feature/x",
+        ref: "refs/heads/feature/x",
+        remoteRef: null,
+        sync: "local-only",
+        committedAt: 5,
+      },
     ]);
   });
 
   test("collapses the two refs of one branch into a single entry", () => {
-    expect(mergeBranches([entry("qa", "a")], [entry("origin/qa", "a")])).toEqual([
-      { name: "qa", ref: "origin/qa", remoteRef: "origin/qa", sync: "in-sync" },
+    expect(mergeBranches([entry("qa", "a", 5)], [entry("origin/qa", "a", 5)])).toEqual([
+      { name: "qa", ref: "origin/qa", remoteRef: "origin/qa", sync: "in-sync", committedAt: 5 },
     ]);
   });
 
   test("prefers the local ref as a source when the tips disagree", () => {
     // The local ref carries work origin does not have, and that work is exactly
     // what would come back as missing from a target.
-    expect(mergeBranches([entry("qa", "a")], [entry("origin/qa", "b")])).toEqual([
-      { name: "qa", ref: "refs/heads/qa", remoteRef: "origin/qa", sync: "diverged" },
+    expect(mergeBranches([entry("qa", "a", 9)], [entry("origin/qa", "b", 4)])).toEqual([
+      {
+        name: "qa",
+        ref: "refs/heads/qa",
+        remoteRef: "origin/qa",
+        sync: "diverged",
+        committedAt: 9,
+      },
     ]);
+  });
+
+  test("dates a branch by the newer of its two refs", () => {
+    // Whichever ref answers, the branch is as recent as the most recent thing
+    // anyone put on it — and that date is the whole ordering of the answer.
+    const merged = mergeBranches([entry("qa", "a", 3)], [entry("origin/qa", "b", 80)]);
+    expect(merged[0]!.committedAt).toBe(80);
   });
 
   test("does not confuse two branches whose names share a fragment", () => {
@@ -169,6 +205,7 @@ describe("resolveTarget", () => {
     ref: `refs/heads/${name}`,
     remoteRef: sync === "diverged" ? `origin/${name}` : null,
     sync,
+    committedAt: 10,
   });
 
   test("reads a target from origin even when a local ref exists", () => {
@@ -181,6 +218,7 @@ describe("resolveTarget", () => {
       ref: "origin/testing",
       remoteRef: "origin/testing",
       sync: "in-sync",
+      committedAt: 10,
     });
   });
 
@@ -199,8 +237,40 @@ describe("resolveTarget", () => {
       ref: "origin/qa",
       remoteRef: "origin/qa",
       sync: "in-sync",
+      committedAt: 10,
     };
     expect(resolveTarget(remote)).toEqual(remote);
+  });
+});
+
+describe("byRecency", () => {
+  const at = (name: string, committedAt: number): BranchRef => ({
+    name,
+    ref: `origin/${name}`,
+    remoteRef: `origin/${name}`,
+    sync: "in-sync",
+    committedAt,
+  });
+
+  test("puts the newest tip first", () => {
+    // The whole ordering of the answer. A branch the team keeps integrating into
+    // has a tip from today; a branch someone finished and left behind froze the
+    // day its author stopped. Ranking by how much of the work arrived instead
+    // was measured on a real repository and buried the integration branch at
+    // position 11 of 14.
+    const sorted = byRecency([at("old", 100), at("new", 900), at("mid", 500)]);
+    expect(sorted.map((b) => b.name)).toEqual(["new", "mid", "old"]);
+  });
+
+  test("breaks a tie by name, so the order never depends on git's", () => {
+    const sorted = byRecency([at("zulu", 100), at("alpha", 100)]);
+    expect(sorted.map((b) => b.name)).toEqual(["alpha", "zulu"]);
+  });
+
+  test("leaves the input alone", () => {
+    const input = [at("old", 1), at("new", 2)];
+    byRecency(input);
+    expect(input.map((b) => b.name)).toEqual(["old", "new"]);
   });
 });
 
@@ -330,13 +400,30 @@ describe.skipIf(!runnable)("against a synthetic repository", () => {
     await repo?.cleanup();
   });
 
-  const ref = (r: string): BranchRef => ({
-    name: branchName(r),
-    ref: r,
-    remoteRef: r.startsWith("origin/") ? r : null,
-    sync: "in-sync",
-  });
-  const ask = (source: string, target: string) => compare(ref(source), ref(target), workspace);
+  const pick = (name: string): BranchRef => {
+    const found = workspace.branches.find((b) => b.name === branchName(name));
+    if (!found) throw new Error(`fixture has no branch ${name}`);
+    return found;
+  };
+
+  /** One source against one target, the way the scan asks about each branch. */
+  const ask = async (source: string, target: string) => {
+    const context = await prepareSource(pick(source), workspace);
+    const hit = await probeTarget(context, pick(target), path);
+    return { context, ...hit };
+  };
+
+  /** The whole answer for one source: every branch that carries any of its work. */
+  const whereIs = async (source: string) => {
+    const hits: Awaited<ReturnType<typeof probeTarget>>[] = [];
+    const summary = await scanTargets(
+      pick(source),
+      workspace,
+      { onHit: (hit) => hits.push(hit), onProgress: () => {} },
+      4,
+    );
+    return { summary, hits: hits.sort((a, b) => b.target.committedAt - a.target.committedAt) };
+  };
 
   describe("findRepoRoot", () => {
     test("resolves the repository from its own root", async () => {
@@ -428,6 +515,8 @@ describe.skipIf(!runnable)("against a synthetic repository", () => {
           SYNTHETIC_SYNC.decoy,
           "develop",
           "feature/ACTIVE-1/partially-shipped",
+          branchName(SYNTHETIC.stacked),
+          branchName(SYNTHETIC.mirror),
           "feature/CLEAN-1/merged-straight-in",
           SYNTHETIC_SYNC.unpushed,
           "main",
@@ -564,11 +653,44 @@ describe.skipIf(!runnable)("against a synthetic repository", () => {
     });
   });
 
-  describe("compare", () => {
+  describe("headBranch", () => {
+    test("names the checked-out branch, so an argument-free run has an answer", async () => {
+      expect(await headBranch(path)).toBe("main");
+    });
+
+    test("says nothing on a detached HEAD rather than guessing", async () => {
+      const tree = `${path}/../wt-detached`;
+      await Bun.$`git -C ${path} worktree add -q --detach ${tree}`.quiet();
+      try {
+        expect(await headBranch(tree)).toBeNull();
+      } finally {
+        await Bun.$`git -C ${path} worktree remove --force ${tree}`.quiet().nothrow();
+      }
+    });
+  });
+
+  describe("ancestorNames", () => {
+    test("names the branches the source already contains", async () => {
+      // One call for the whole repository, which is what makes it affordable to
+      // ask at all.
+      const names = await ancestorNames(path, SYNTHETIC.active);
+
+      expect(names.has(branchName(SYNTHETIC.stacked))).toBe(true);
+      expect(names.has(branchName(SYNTHETIC.mirror))).toBe(true);
+      expect(names.has("develop")).toBe(true);
+    });
+
+    test("leaves out a branch the source does not contain", async () => {
+      const names = await ancestorNames(path, SYNTHETIC.active);
+      expect(names.has("preprod")).toBe(false);
+    });
+  });
+
+  describe("probeTarget", () => {
     test("an active branch is partial where some of its commits arrived", async () => {
       const result = await ask(SYNTHETIC.active, SYNTHETIC.preprod);
 
-      expect(result.strategy).toBe("cherry");
+      expect(result.context.strategy).toBe("cherry");
       expect(result.verdict).toMatchObject({ state: "partial", present: 4, total: 5 });
     });
 
@@ -588,24 +710,19 @@ describe.skipIf(!runnable)("against a synthetic repository", () => {
     test("answers for a source that exists only on this machine", async () => {
       // The whole point of listing local refs: before this, a branch living in
       // a worktree and never pushed could not be asked about at all.
-      const source = workspace.branches.find((b) => b.name === SYNTHETIC_SYNC.unpushed)!;
-      const target = workspace.branches.find((b) => b.name === "qa")!;
-      const result = await compare(source, target, workspace);
+      const result = await ask(SYNTHETIC_SYNC.unpushed, "qa");
 
-      expect(source.sync).toBe("local-only");
-      expect(result.own).toHaveLength(1);
+      expect(pick(SYNTHETIC_SYNC.unpushed).sync).toBe("local-only");
+      expect(result.context.own).toHaveLength(1);
       expect(result.verdict).toMatchObject({ state: "absent", present: 0, total: 1 });
     });
 
     test("reads a diverged target from origin, not from the local copy", async () => {
       // A local copy of a long-lived branch runs behind, and measured against
       // one, work that arrived weeks ago reads as missing.
-      const source = workspace.branches.find((b) => b.name === SYNTHETIC_SYNC.unpushed)!;
-      const target = workspace.branches.find((b) => b.name === SYNTHETIC_SYNC.diverged)!;
-      const result = await compare(source, target, workspace);
+      const result = await ask(SYNTHETIC_SYNC.unpushed, SYNTHETIC_SYNC.diverged);
 
-      expect(target.sync).toBe("diverged");
-      expect(target.ref).toBe(`refs/heads/${SYNTHETIC_SYNC.diverged}`);
+      expect(pick(SYNTHETIC_SYNC.diverged).ref).toBe(`refs/heads/${SYNTHETIC_SYNC.diverged}`);
       expect(result.target.ref).toBe(`origin/${SYNTHETIC_SYNC.diverged}`);
     });
 
@@ -620,14 +737,14 @@ describe.skipIf(!runnable)("against a synthetic repository", () => {
     test("a branch merged straight in is full, counted against its own commits", async () => {
       const result = await ask(SYNTHETIC.clean, SYNTHETIC.qa);
 
-      expect(result.strategy).toBe("cherry");
+      expect(result.context.strategy).toBe("cherry");
       expect(result.verdict).toMatchObject({ state: "full", present: 2, total: 2 });
     });
 
     test("a branch the base absorbed falls back to ancestry", async () => {
       const result = await ask(SYNTHETIC.absorbed, SYNTHETIC.qa);
 
-      expect(result.strategy).toBe("ancestry");
+      expect(result.context.strategy).toBe("ancestry");
       expect(result.verdict).toMatchObject({ state: "full", approximate: true });
     });
 
@@ -637,24 +754,107 @@ describe.skipIf(!runnable)("against a synthetic repository", () => {
       expect(verdict).toMatchObject({ state: "absent", present: 0, total: 0, missing: [] });
     });
 
-    test("carries both branches through, so the UI can show what was compared", async () => {
-      const result = await ask(SYNTHETIC.active, SYNTHETIC.preprod);
-
-      expect(result.source.ref).toBe(SYNTHETIC.active);
-      expect(result.target.ref).toBe(SYNTHETIC.preprod);
-    });
-
     test("reports the base it measured against", async () => {
-      expect((await ask(SYNTHETIC.active, SYNTHETIC.qa)).baseRef).toBe(SYNTHETIC.develop);
+      expect((await ask(SYNTHETIC.active, SYNTHETIC.qa)).context.baseRef).toBe(SYNTHETIC.develop);
     });
 
-    test("compares any two branches, with no notion of a special one", async () => {
-      // Two feature branches: nothing here is an environment, and the tool does
-      // not care.
-      const result = await ask(SYNTHETIC.clean, SYNTHETIC.active);
+    test("marks a target the source was built on", async () => {
+      expect((await ask(SYNTHETIC.active, SYNTHETIC.stacked)).ancestor).toBe(true);
+    });
 
-      expect(result.verdict.state).toBe("absent");
-      expect(result.verdict.total).toBe(2);
+    test("does not mark a target that merely shares commits", async () => {
+      expect((await ask(SYNTHETIC.active, SYNTHETIC.preprod)).ancestor).toBe(false);
+    });
+  });
+
+  describe("scanTargets", () => {
+    test("finds every branch carrying the work without being told which to check", async () => {
+      // The question the tool exists to answer, asked in one move. Nothing here
+      // names a branch: the repository is asked what it has.
+      const { hits } = await whereIs(SYNTHETIC.active);
+
+      expect(hits.map((h) => h.target.name).sort()).toEqual(
+        [
+          branchName(SYNTHETIC.preprod),
+          branchName(SYNTHETIC.stacked),
+          branchName(SYNTHETIC.mirror),
+        ].sort(),
+      );
+    });
+
+    test("never lists a branch that has none of the work", async () => {
+      const { hits, summary } = await whereIs(SYNTHETIC.active);
+
+      expect(hits.every((h) => h.verdict.state !== "absent")).toBe(true);
+      expect(summary.absent).toBeGreaterThan(0);
+    });
+
+    test("counts the branches it left out, so the list never reads as truncated", async () => {
+      const { hits, summary } = await whereIs(SYNTHETIC.active);
+
+      // Everything but the source itself was compared, and every comparison
+      // either became a hit or was counted as absent.
+      expect(summary.scanned).toBe(workspace.branches.length - 1);
+      expect(summary.absent + hits.length).toBe(summary.scanned);
+    });
+
+    test("never compares the source against itself", async () => {
+      const { hits } = await whereIs(SYNTHETIC.active);
+      expect(hits.some((h) => h.target.name === branchName(SYNTHETIC.active))).toBe(false);
+    });
+
+    test("carries the source's own commits so the screen can count them", async () => {
+      const { summary } = await whereIs(SYNTHETIC.active);
+
+      expect(summary.context.own).toHaveLength(5);
+      expect(summary.context.strategy).toBe("cherry");
+    });
+
+    test("orders newest tip first", async () => {
+      const { hits } = await whereIs(SYNTHETIC.active);
+      const dates = hits.map((h) => h.target.committedAt);
+
+      expect([...dates].sort((a, b) => b - a)).toEqual(dates);
+    });
+
+    test("marks the branches the source was built on, and only those", async () => {
+      const { hits } = await whereIs(SYNTHETIC.active);
+      const ancestors = hits.filter((h) => h.ancestor).map((h) => h.target.name);
+
+      expect(ancestors.sort()).toEqual(
+        [branchName(SYNTHETIC.stacked), branchName(SYNTHETIC.mirror)].sort(),
+      );
+    });
+
+    test("a stacked earlier slice is an ancestor and only partial — the noise to fold", async () => {
+      const { hits } = await whereIs(SYNTHETIC.active);
+      const stacked = hits.find((h) => h.target.name === branchName(SYNTHETIC.stacked));
+
+      expect(stacked).toMatchObject({ ancestor: true });
+      expect(stacked!.verdict).toMatchObject({ state: "partial", present: 3, total: 5 });
+    });
+
+    test("a branch at the same commit is an ancestor but full — never foldable", async () => {
+      // Merging into a branch and then rebasing onto it leaves that branch an
+      // ancestor too. Folding by ancestry alone would hide the answer.
+      const { hits } = await whereIs(SYNTHETIC.active);
+      const mirror = hits.find((h) => h.target.name === branchName(SYNTHETIC.mirror));
+
+      expect(mirror).toMatchObject({ ancestor: true });
+      expect(mirror!.verdict).toMatchObject({ state: "full", present: 5, total: 5 });
+    });
+
+    test("answers for a branch the base already absorbed", async () => {
+      const { hits, summary } = await whereIs(SYNTHETIC.absorbed);
+
+      expect(summary.context.strategy).toBe("ancestry");
+      expect(hits.every((h) => h.verdict.approximate)).toBe(true);
+      expect(hits.map((h) => h.target.name)).toContain("qa");
+    });
+
+    test("answers for a branch that never left this machine", async () => {
+      const { summary } = await whereIs(SYNTHETIC_SYNC.unpushed);
+      expect(summary.context.own).toHaveLength(1);
     });
   });
 });
